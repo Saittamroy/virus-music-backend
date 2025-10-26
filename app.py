@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
-from youtubesearchpython import VideosSearch
-import yt_dlp
+import aiohttp
 import os
 from typing import Dict, List
+import json
 
 app = FastAPI(title="Virus Music Radio API")
 
@@ -22,105 +22,135 @@ current_audio_url = None
 
 class MusicStreamer:
     def __init__(self):
-        # Simple yt-dlp config for audio streaming only
-        self.ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-        }
+        self.deezer_base = "https://api.deezer.com"
     
-    def search_youtube(self, query: str) -> List[Dict]:
-        """Search YouTube using youtube-search-python (no blocking)"""
+    async def search_music(self, query: str) -> List[Dict]:
+        """Search music using Deezer API"""
         try:
-            print(f"🔍 Searching for: {query}")
+            print(f"🔍 Searching Deezer for: {query}")
             
-            # Use youtube-search-python for search (never gets blocked)
-            videos_search = VideosSearch(query, limit=5)
-            results = videos_search.result()
-            
-            if not results or 'result' not in results:
-                return self._get_fallback_songs(query)
-            
-            formatted_results = []
-            for video in results['result']:
-                if video:
-                    # Get duration in seconds
-                    duration_str = video.get('duration', '0:00')
-                    duration_parts = duration_str.split(':')
-                    if len(duration_parts) == 2:
-                        duration = int(duration_parts[0]) * 60 + int(duration_parts[1])
-                    else:
-                        duration = 0
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.deezer_base}/search?q={query}&limit=5") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        results = []
+                        for track in data.get('data', [])[:5]:
+                            results.append({
+                                'id': str(track['id']),
+                                'title': track['title'],
+                                'artist': track['artist']['name'],
+                                'duration': track['duration'],
+                                'thumbnail': track['album']['cover_medium'],
+                                'preview_url': track.get('preview', ''),
+                                'source': 'deezer'
+                            })
+                        
+                        if results:
+                            return results
                     
-                    formatted_results.append({
-                        'id': video.get('id', ''),
-                        'title': video.get('title', 'Unknown Title'),
-                        'url': video.get('link', ''),
-                        'duration': duration,
-                        'thumbnail': video.get('thumbnails', [{}])[0].get('url', '') if video.get('thumbnails') else '',
-                        'uploader': video.get('channel', {}).get('name', 'Unknown Artist')
-                    })
-            
-            return formatted_results[:3]  # Return top 3 results
-            
-        except Exception as e:
-            print(f"Search error: {e}")
-            return self._get_fallback_songs(query)
-    
-    def get_audio_stream(self, video_url: str) -> str:
-        """Get audio stream URL with fallback"""
-        try:
-            print(f"🎵 Getting audio stream from: {video_url}")
-            
-            # Try to get audio stream
-            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                if info and 'url' in info:
-                    return info['url']
-                else:
-                    raise Exception("No audio URL found")
+                    # Fallback to Jamendo API
+                    return await self.search_jamendo(query)
                     
         except Exception as e:
-            print(f"Audio stream error: {e}")
-            # Return a guaranteed working audio stream
-            return "https://ccrma.stanford.edu/~jos/mp3/gtr-nylon22.mp3"
+            print(f"Deezer search error: {e}")
+            return await self.search_jamendo(query)
     
-    def _get_fallback_songs(self, query: str) -> List[Dict]:
-        """Provide guaranteed fallback results that always work"""
-        fallback_songs = [
+    async def search_jamendo(self, query: str) -> List[Dict]:
+        """Search free music using Jamendo API"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://api.jamendo.com/v3.0/tracks/?client_id=YOUR_CLIENT_ID&format=json&limit=5&search={query}") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        results = []
+                        for track in data.get('results', [])[:3]:
+                            results.append({
+                                'id': track['id'],
+                                'title': track['name'],
+                                'artist': track['artist_name'],
+                                'duration': track['duration'],
+                                'thumbnail': track['album_image'],
+                                'preview_url': track['audio'],
+                                'source': 'jamendo'
+                            })
+                        return results
+        except:
+            pass
+        
+        # Final fallback - curated free music
+        return self._get_curated_music(query)
+    
+    def _get_curated_music(self, query: str) -> List[Dict]:
+        """Curated list of free-to-use music"""
+        free_music = [
             {
-                'id': 'kJQP7kiw5Fk',
-                'title': 'Despacito',
-                'url': 'https://www.youtube.com/watch?v=kJQP7kiw5Fk',
-                'duration': 280,
-                'thumbnail': 'https://i.ytimg.com/vi/kJQP7kiw5Fk/hqdefault.jpg',
-                'uploader': 'Luis Fonsi'
+                'id': '1',
+                'title': 'Summer Walk',
+                'artist': 'Background Music',
+                'duration': 180,
+                'thumbnail': '',
+                'preview_url': 'https://www.soundjay.com/music/summer-walk-01.mp3',
+                'source': 'soundjay'
             },
             {
-                'id': 'JGwWNGJdvx8',
-                'title': 'Shape of You', 
-                'url': 'https://www.youtube.com/watch?v=JGwWNGJdvx8',
-                'duration': 234,
-                'thumbnail': 'https://i.ytimg.com/vi/JGwWNGJdvx8/hqdefault.jpg',
-                'uploader': 'Ed Sheeran'
+                'id': '2', 
+                'title': 'Acoustic Breeze',
+                'artist': 'Bensound',
+                'duration': 157,
+                'thumbnail': '',
+                'preview_url': 'https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3',
+                'source': 'bensound'
             },
             {
-                'id': '60ItHLz5WEA',
-                'title': 'Blinding Lights',
-                'url': 'https://www.youtube.com/watch?v=60ItHLz5WEA',
-                'duration': 203,
-                'thumbnail': 'https://i.ytimg.com/vi/60ItHLz5WEA/hqdefault.jpg',
-                'uploader': 'The Weeknd'
+                'id': '3',
+                'title': 'Better Days',
+                'artist': 'Bensound', 
+                'duration': 188,
+                'thumbnail': '',
+                'preview_url': 'https://www.bensound.com/bensound-music/bensound-betterdays.mp3',
+                'source': 'bensound'
+            },
+            {
+                'id': '4',
+                'title': 'Jazz Piano',
+                'artist': 'Background Music',
+                'duration': 120,
+                'thumbnail': '',
+                'preview_url': 'https://ccrma.stanford.edu/~jos/mp3/gtr-nylon22.mp3',
+                'source': 'ccrma'
             }
         ]
         
-        # Try to match query, otherwise return all
+        # Filter by query
         if query:
-            filtered = [song for song in fallback_songs 
-                       if query.lower() in song['title'].lower() or query.lower() in song['uploader'].lower()]
-            return filtered if filtered else fallback_songs[:2]
+            filtered = [track for track in free_music 
+                       if query.lower() in track['title'].lower() or query.lower() in track['artist'].lower()]
+            return filtered if filtered else free_music[:2]
         
-        return fallback_songs[:2]
+        return free_music[:3]
+    
+    async def get_audio_stream(self, track_data: Dict) -> str:
+        """Get audio stream URL from track data"""
+        try:
+            # Use the preview URL directly
+            if track_data.get('preview_url'):
+                return track_data['preview_url']
+            
+            # Fallback to Deezer preview
+            if track_data.get('source') == 'deezer' and track_data.get('id'):
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{self.deezer_base}/track/{track_data['id']}") as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return data.get('preview', '')
+            
+            # Final fallback
+            return "https://www.soundjay.com/music/summer-walk-01.mp3"
+            
+        except Exception as e:
+            print(f"Audio stream error: {e}")
+            return "https://www.soundjay.com/music/summer-walk-01.mp3"
 
 music_streamer = MusicStreamer()
 
@@ -128,60 +158,48 @@ music_streamer = MusicStreamer()
 async def root():
     return {
         "message": "Virus Music Radio API", 
-        "status": "online", 
-        "version": "4.0.0 - youtube-search-python"
+        "status": "online",
+        "version": "5.0.0 - Deezer & Free Music APIs"
     }
 
 @app.get("/api/search")
 async def search_music(q: str):
-    """Search for music - always returns results"""
+    """Search music using multiple free APIs"""
     if not q:
         raise HTTPException(status_code=400, detail="Query parameter required")
     
     print(f"🎵 API Search: {q}")
-    results = music_streamer.search_youtube(q)
+    results = await music_streamer.search_music(q)
     
     return {
         "query": q, 
         "results": results, 
-        "message": f"Found {len(results)} results",
-        "source": "youtube-search-python"
+        "message": f"Found {len(results)} tracks",
+        "source": "deezer+free_music"
     }
 
 @app.post("/api/play")
-async def play_music(video_url: str):
-    """Play music - always works with fallback"""
+async def play_music(track_data: str):
+    """Play music from free APIs"""
     global current_track, player_status, current_audio_url
     
     try:
-        print(f"🎵 Playing: {video_url}")
+        # Parse track data (sent as JSON string)
+        track = json.loads(track_data)
+        print(f"🎵 Playing: {track.get('title', 'Unknown')}")
         
-        # Get audio stream (has fallback)
-        audio_url = music_streamer.get_audio_stream(video_url)
+        # Get audio stream
+        audio_url = await music_streamer.get_audio_stream(track)
         
-        # Get track info from search
-        search_results = music_streamer.search_youtube("")
-        for song in search_results:
-            if song['url'] == video_url:
-                current_track = {
-                    'id': song['id'],
-                    'title': song['title'],
-                    'artist': song['uploader'],
-                    'duration': song['duration'],
-                    'thumbnail': song['thumbnail'],
-                    'url': video_url
-                }
-                break
-        else:
-            # Fallback track info
-            current_track = {
-                'id': 'live',
-                'title': 'Music Stream',
-                'artist': 'Your Music Bot',
-                'duration': 0,
-                'thumbnail': None,
-                'url': video_url
-            }
+        current_track = {
+            'id': track.get('id', ''),
+            'title': track.get('title', 'Unknown Track'),
+            'artist': track.get('artist', 'Unknown Artist'),
+            'duration': track.get('duration', 0),
+            'thumbnail': track.get('thumbnail', ''),
+            'url': audio_url,
+            'source': track.get('source', 'free')
+        }
         
         current_audio_url = audio_url
         player_status = "playing"
@@ -193,7 +211,7 @@ async def play_music(video_url: str):
             "status": "playing", 
             "track": current_track,
             "stream_url": stream_url,
-            "message": "🎵 Music is now streaming!"
+            "message": f"🎵 Now playing: {current_track['title']} - {current_track['artist']}"
         }
         
     except Exception as e:
@@ -202,12 +220,12 @@ async def play_music(video_url: str):
 
 @app.get("/api/stream")
 async def stream_audio():
-    """Redirect to audio stream - always works"""
+    """Redirect to audio stream"""
     global current_audio_url, player_status
     
     if player_status != "playing" or not current_audio_url:
-        # Still return a working audio stream
-        return RedirectResponse(url="https://ccrma.stanford.edu/~jos/mp3/gtr-nylon22.mp3")
+        # Return a default free music stream
+        return RedirectResponse(url="https://www.soundjay.com/music/summer-walk-01.mp3")
     
     return RedirectResponse(url=current_audio_url)
 
@@ -247,11 +265,7 @@ async def get_radio_url():
 @app.get("/health")
 async def health_check():
     return {
-        "status": "healthy", 
+        "status": "healthy",
         "player_status": player_status,
-        "service": "youtube-search-python"
+        "sources": "deezer, jamendo, free_music"
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
