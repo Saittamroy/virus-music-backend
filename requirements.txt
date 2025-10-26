@@ -1,4 +1,4 @@
 fastapi==0.104.1
 uvicorn==0.24.0
-yt-dlp==2023.11.16
+play-dl==8.3.0
 aiohttp==3.9.1
