@@ -24,4 +24,4 @@ None required - uses default configuration
 
 ## Get Your Radio URL
 After deployment, visit:
-`https://your-app.railway.app/api/radio/url`
+`https://your-app/api/radio/url`
