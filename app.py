@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 import yt_dlp
-import subprocess
 import os
 from typing import Dict, List
 
@@ -14,20 +14,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Radio configuration - will be set by Railway
-RADIO_CONFIG = {
-    'host': os.getenv('RAILWAY_STATIC_URL', 'localhost').replace('https://', '').replace('http://', ''),
-    'port': '8001',
-    'password': 'hackme',
-    'mount': '/highrise'
-}
-
 # Global state
-current_stream_process = None
 current_track = None
 player_status = "stopped"
+current_audio_url = None
 
-class RadioStreamer:
+class MusicStreamer:
     def __init__(self):
         self.ydl_opts = {
             'format': 'bestaudio/best',
@@ -60,76 +52,24 @@ class RadioStreamer:
             print(f"Search error: {e}")
             return []
     
-    def start_stream(self, video_url: str) -> bool:
-        """Start streaming YouTube audio to Icecast"""
-        global current_stream_process, player_status, current_track
-        
+    def get_audio_stream(self, video_url: str) -> str:
+        """Get direct audio stream URL from YouTube"""
         try:
-            # Stop existing stream
-            if current_stream_process:
-                current_stream_process.terminate()
-                current_stream_process = None
-            
-            # Get stream URL and info
             with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=False)
-                audio_url = info['url']
-                
-                # Store track info
-                current_track = {
-                    'id': info['id'],
-                    'title': info['title'],
-                    'artist': info.get('uploader', 'Unknown'),
-                    'duration': info.get('duration', 0),
-                    'thumbnail': info.get('thumbnail'),
-                    'url': video_url
-                }
-            
-            # Build FFmpeg command for Icecast streaming
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-re',
-                '-i', audio_url,
-                '-acodec', 'libmp3lame',
-                '-ab', '128k',
-                '-ac', '2',
-                '-content_type', 'audio/mpeg',
-                '-f', 'mp3',
-                f'icecast://source:{RADIO_CONFIG["password"]}@{RADIO_CONFIG["host"]}:{RADIO_CONFIG["port"]}{RADIO_CONFIG["mount"]}'
-            ]
-            
-            print(f"🎧 Starting stream to Icecast...")
-            
-            # Start streaming process
-            current_stream_process = subprocess.Popen(ffmpeg_cmd)
-            player_status = "playing"
-            return True
-            
+                return info['url']
         except Exception as e:
-            print(f"Stream error: {e}")
-            player_status = "error"
-            return False
-    
-    def stop_stream(self):
-        """Stop current radio stream"""
-        global current_stream_process, player_status, current_track
-        
-        if current_stream_process:
-            current_stream_process.terminate()
-            current_stream_process = None
-        
-        current_track = None
-        player_status = "stopped"
+            print(f"Audio stream error: {e}")
+            return None
 
-radio_streamer = RadioStreamer()
+music_streamer = MusicStreamer()
 
 @app.get("/")
 async def root():
     return {
         "message": "Virus Music Radio API", 
         "status": "online",
-        "radio_url": f"http://{RADIO_CONFIG['host']}:{RADIO_CONFIG['port']}{RADIO_CONFIG['mount']}",
-        "instructions": "Use /api/radio/url to get your Highrise stream URL"
+        "version": "1.0.0"
     }
 
 @app.get("/api/search")
@@ -138,28 +78,72 @@ async def search_music(q: str):
     if not q:
         raise HTTPException(status_code=400, detail="Query parameter required")
     
-    results = radio_streamer.search_youtube(q)
+    results = music_streamer.search_youtube(q)
     return {"query": q, "results": results}
 
 @app.post("/api/play")
 async def play_music(video_url: str):
-    """Play music on radio stream"""
-    success = radio_streamer.start_stream(video_url)
+    """Play music and return stream information"""
+    global current_track, player_status, current_audio_url
     
-    if success:
+    try:
+        # Get audio stream URL
+        audio_url = music_streamer.get_audio_stream(video_url)
+        if not audio_url:
+            raise HTTPException(status_code=500, detail="Could not get audio stream")
+        
+        # Get track info
+        with yt_dlp.YoutubeDL(music_streamer.ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            current_track = {
+                'id': info['id'],
+                'title': info['title'],
+                'artist': info.get('uploader', 'Unknown Artist'),
+                'duration': info.get('duration', 0),
+                'thumbnail': info.get('thumbnail'),
+                'url': video_url
+            }
+        
+        current_audio_url = audio_url
+        player_status = "playing"
+        
+        # Get the public URL for this deployment
+        base_url = os.getenv('RAILWAY_STATIC_URL', 'http://localhost:8000')
+        stream_url = f"{base_url}/api/stream"
+        
         return {
             "status": "playing", 
             "track": current_track,
-            "radio_url": f"http://{RADIO_CONFIG['host']}:{RADIO_CONFIG['port']}{RADIO_CONFIG['mount']}"
+            "stream_url": stream_url,
+            "message": "Music is now streaming! Use !url to get the stream URL for Highrise."
         }
-    else:
+        
+    except Exception as e:
+        print(f"Play error: {e}")
         raise HTTPException(status_code=500, detail="Failed to start stream")
+
+@app.get("/api/stream")
+async def stream_audio():
+    """Redirect to the actual audio stream (Highrise will follow this)"""
+    global current_audio_url, player_status
+    
+    if player_status != "playing" or not current_audio_url:
+        raise HTTPException(status_code=404, detail="No music currently playing")
+    
+    # Redirect Highrise to the actual audio stream URL
+    return RedirectResponse(url=current_audio_url)
 
 @app.post("/api/stop")
 async def stop_music():
-    """Stop radio stream"""
-    radio_streamer.stop_stream()
-    return {"status": "stopped"}
+    """Stop music streaming"""
+    global current_track, player_status, current_audio_url
+    
+    current_track = None
+    player_status = "stopped"
+    current_audio_url = None
+    
+    return {"status": "stopped", "message": "Music stopped"}
 
 @app.get("/api/status")
 async def get_player_status():
@@ -167,23 +151,33 @@ async def get_player_status():
     return {
         "status": player_status,
         "current_track": current_track,
-        "radio_url": f"http://{RADIO_CONFIG['host']}:{RADIO_CONFIG['port']}{RADIO_CONFIG['mount']}",
-        "stream_active": current_stream_process is not None
+        "stream_active": player_status == "playing"
     }
 
 @app.get("/api/radio/url")
 async def get_radio_url():
     """Get the radio stream URL for Highrise"""
-    return {
-        "radio_url": f"http://{RADIO_CONFIG['host']}:{RADIO_CONFIG['port']}{RADIO_CONFIG['mount']}",
-        "status": player_status,
-        "instructions": "Add this URL to your Highrise room music settings"
-    }
+    base_url = os.getenv('RAILWAY_STATIC_URL', 'http://localhost:8000')
+    stream_url = f"{base_url}/api/stream"
+    
+    if player_status == "playing":
+        return {
+            "radio_url": stream_url,
+            "status": "playing",
+            "current_track": current_track['title'],
+            "instructions": "Add this URL to your Highrise room music settings! The music will play automatically."
+        }
+    else:
+        return {
+            "radio_url": stream_url,
+            "status": "stopped", 
+            "instructions": "Play a song first using !play command, then music will stream to this URL"
+        }
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "radio_streaming": current_stream_process is not None,
-        "current_track": current_track
+        "player_status": player_status,
+        "current_track": current_track['title'] if current_track else None
     }
