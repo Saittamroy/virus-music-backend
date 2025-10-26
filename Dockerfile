@@ -1,17 +1,9 @@
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install FFmpeg for audio processing
 RUN apt-get update && apt-get install -y \
-    icecast2 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
-# Icecast user is automatically created by the icecast2 package
-# No need to create it again
-
-# Copy Icecast config
-COPY icecast.xml /etc/icecast2/icecast.xml
-RUN chown icecast:icecast /etc/icecast2/icecast.xml
 
 # Create app directory
 WORKDIR /app
@@ -23,10 +15,6 @@ RUN pip install -r requirements.txt
 # Copy application
 COPY . .
 
-# Create startup script
-COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+EXPOSE 8000
 
-EXPOSE 8000 8001
-
-CMD ["./start.sh"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
