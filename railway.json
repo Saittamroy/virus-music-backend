@@ -1,9 +1,11 @@
-virus-music-backend/
-├── Dockerfile
-├── icecast.xml
-├── start.sh
-├── app.py
-├── requirements.txt
-├── railway.json
-├── README.md
-└── .gitignore
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "sleepApplication": false,
+    "restartPolicyType": "ON_FAILURE"
+  }
+}
