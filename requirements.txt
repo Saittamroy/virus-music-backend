@@ -1,5 +1,4 @@
 fastapi==0.104.1
 uvicorn==0.24.0
-youtube-search-python==1.6.6
 aiohttp==3.9.1
-yt-dlp==2023.11.16
+requests==2.31.0
