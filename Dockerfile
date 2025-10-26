@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Create icecast user
-RUN useradd -m icecast
+# Icecast user is automatically created by the icecast2 package
+# No need to create it again
 
 # Copy Icecast config
 COPY icecast.xml /etc/icecast2/icecast.xml
