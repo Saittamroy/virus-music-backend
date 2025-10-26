@@ -1,11 +1,14 @@
 #!/bin/bash
 
+# Fix permissions for Icecast
+chown -R icecast:icecast /var/log/icecast2
+
 # Start Icecast in background
 echo "🎧 Starting Icecast server..."
-icecast2 -c /etc/icecast2/icecast.xml &
+sudo -u icecast icecast2 -c /etc/icecast2/icecast.xml &
 
 # Wait for Icecast to start
-sleep 3
+sleep 5
 
 # Start FastAPI server
 echo "🚀 Starting FastAPI server on port $PORT..."
