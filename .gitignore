@@ -1,9 +1,5 @@
- virus-music-backend/
-├── Dockerfile
-├── icecast.xml
-├── start.sh
-├── app.py
-├── requirements.txt
-├── railway.json
-├── README.md
-└── .gitignore
+__pycache__/
+*.pyc
+.env
+.venv
+*.log
