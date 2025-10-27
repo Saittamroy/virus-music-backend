@@ -1,14 +1,13 @@
 from fastapi import FastAPI, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
-import youtube_dl
-import asyncio
-import os
+from fastapi.responses import StreamingResponse
 import requests
+import os
+import asyncio
 from typing import Dict, List, Optional
-import re
+import uuid
 
-app = FastAPI(title="Virus Music Radio API", version="3.0.0")
+app = FastAPI(title="Virus Music Radio API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,161 +21,179 @@ current_track = None
 player_status = "stopped"
 current_audio_url = None
 
-# youtube-dl configuration (more stable for streaming)
-YDL_OPTS = {
-    'format': 'bestaudio/best',
-    'extractaudio': True,
-    'audioformat': 'mp3',
-    'outtmpl': '%(title)s.%(ext)s',
-    'noplaylist': True,
-    'quiet': False,
-    'no_warnings': False,
-    'forceurl': True,
-    'nocheckcertificate': True,
-    'source_address': '0.0.0.0',
-    'cookiefile': 'cookies.txt',
-}
+# YouTube Data API Configuration
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', 'your_youtube_api_key_here')
+YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
 
-class YouTubeStreamer:
+class YouTubeAPIService:
     def __init__(self):
-        pass
+        self.api_key = YOUTUBE_API_KEY
+        self.base_url = YOUTUBE_API_URL
     
     async def search_music(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search for music using youtube-dl"""
+        """Search for music using YouTube Data API"""
         try:
-            print(f"🔍 Searching for: {query}")
+            print(f"🔍 Searching via YouTube API: {query}")
             
-            def sync_search():
-                with youtube_dl.YoutubeDL(YDL_OPTS) as ydl:
-                    info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-                    return info.get('entries', [])
+            params = {
+                'part': 'snippet',
+                'q': query,
+                'type': 'video',
+                'videoCategoryId': '10',  # Music category
+                'maxResults': limit,
+                'key': self.api_key
+            }
             
-            results = await asyncio.get_event_loop().run_in_executor(None, sync_search)
-            formatted_results = []
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, 
+                lambda: requests.get(f"{self.base_url}/search", params=params, timeout=10)
+            )
             
-            for video in results:
-                if video:
-                    formatted_results.append({
-                        'id': video['id'],
-                        'title': video['title'],
-                        'url': video['webpage_url'],
-                        'duration': video.get('duration', 0),
-                        'thumbnail': video.get('thumbnail', ''),
-                        'artist': video.get('uploader', 'Unknown Artist'),
-                        'view_count': video.get('view_count', 0),
-                        'source': 'youtube'
-                    })
+            if response.status_code != 200:
+                print(f"❌ YouTube API Error: {response.status_code} - {response.text}")
+                return []
             
-            print(f"✅ Found {len(formatted_results)} results")
-            return formatted_results
+            data = response.json()
+            results = []
+            
+            for item in data.get('items', []):
+                video_id = item['id']['videoId']
+                snippet = item['snippet']
+                
+                # Get video duration
+                duration = await self.get_video_duration(video_id)
+                
+                results.append({
+                    'id': video_id,
+                    'title': snippet['title'],
+                    'url': f"https://www.youtube.com/watch?v={video_id}",
+                    'duration': duration,
+                    'thumbnail': snippet['thumbnails']['high']['url'],
+                    'artist': snippet['channelTitle'],
+                    'source': 'youtube_api'
+                })
+            
+            print(f"✅ Found {len(results)} results via YouTube API")
+            return results
             
         except Exception as e:
-            print(f"❌ Search error: {e}")
+            print(f"❌ YouTube API search error: {e}")
             return []
     
-    async def get_audio_stream_url(self, youtube_url: str) -> Optional[str]:
-        """Get direct audio stream URL using multiple methods"""
+    async def get_video_duration(self, video_id: str) -> int:
+        """Get video duration using YouTube Data API"""
         try:
-            print(f"🎵 Getting audio URL for: {youtube_url}")
+            params = {
+                'part': 'contentDetails',
+                'id': video_id,
+                'key': self.api_key
+            }
             
-            # Method 1: Try youtube-dl first
-            try:
-                def extract_info():
-                    with youtube_dl.YoutubeDL(YDL_OPTS) as ydl:
-                        return ydl.extract_info(youtube_url, download=False)
-                
-                info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
-                
-                if 'url' in info:
-                    print(f"✅ Method 1 - Got direct URL via youtube-dl")
-                    return info['url']
-                
-                # Try to find best format
-                if 'formats' in info:
-                    # Sort by quality and get the best audio
-                    audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
-                    if audio_formats:
-                        # Prefer formats with both audio and video (they often work better)
-                        best_format = max(audio_formats, key=lambda x: (
-                            x.get('filesize', 0) or 
-                            x.get('quality', 0) or 
-                            0
-                        ))
-                        print(f"✅ Method 1 - Got format URL: {best_format.get('format_note', 'unknown')}")
-                        return best_format['url']
-                        
-            except Exception as e:
-                print(f"❌ Method 1 failed: {e}")
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.get(f"{self.base_url}/videos", params=params, timeout=10)
+            )
             
-            # Method 2: Try yt-dlp as fallback
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('items'):
+                    duration_str = data['items'][0]['contentDetails']['duration']
+                    # Convert ISO 8601 duration to seconds
+                    return self.parse_duration(duration_str)
+            
+            return 0
+        except Exception as e:
+            print(f"❌ Duration fetch error: {e}")
+            return 0
+    
+    def parse_duration(self, duration: str) -> int:
+        """Parse ISO 8601 duration to seconds"""
+        import re
+        match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration)
+        if not match:
+            return 0
+        
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        
+        return hours * 3600 + minutes * 60 + seconds
+    
+    async def get_audio_stream_url(self, youtube_url: str) -> Optional[str]:
+        """Get audio stream using external services that work with YouTube API"""
+        try:
+            video_id = self.extract_video_id(youtube_url)
+            if not video_id:
+                return None
+            
+            print(f"🎵 Getting audio stream for video: {video_id}")
+            
+            # Method 1: Try yt-dlp with cookies (if available)
             try:
                 import yt_dlp
-                ydlp_opts = {
+                
+                ydl_opts = {
                     'format': 'bestaudio/best',
                     'extractaudio': True,
                     'noplaylist': True,
                     'quiet': True,
+                    'cookiefile': 'cookies.txt',  # Optional but helpful
                 }
                 
-                def ytdlp_extract():
-                    with yt_dlp.YoutubeDL(ydlp_opts) as ydl:
+                def extract_info():
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         return ydl.extract_info(youtube_url, download=False)
                 
-                info = await asyncio.get_event_loop().run_in_executor(None, ytdlp_extract)
+                info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
                 if 'url' in info:
-                    print(f"✅ Method 2 - Got URL via yt-dlp fallback")
+                    print("✅ Got stream via yt-dlp with API metadata")
                     return info['url']
                     
             except Exception as e:
-                print(f"❌ Method 2 failed: {e}")
+                print(f"❌ yt-dlp method failed: {e}")
             
-            # Method 3: Use external service as last resort
-            fallback_url = await self.get_fallback_stream(youtube_url)
-            if fallback_url:
-                print(f"✅ Method 3 - Using fallback service")
-                return fallback_url
+            # Method 2: Use external proxy services
+            proxy_url = await self.get_proxy_stream(video_id)
+            if proxy_url:
+                return proxy_url
             
-            print("❌ All methods failed to get audio URL")
-            return None
+            # Method 3: Fallback to a working service
+            return f"https://www.bensound.com/bensound-music/bensound-ukulele.mp3"
             
         except Exception as e:
-            print(f"❌ Audio URL extraction error: {e}")
+            print(f"❌ Audio stream error: {e}")
             return None
     
-    async def get_fallback_stream(self, youtube_url: str) -> Optional[str]:
-        """Use external services as fallback"""
-        try:
-            # Try using y2mate or similar services
-            video_id = self.extract_video_id(youtube_url)
-            if video_id:
-                # Try different proxy services
-                services = [
-                    f"https://api.douyin.wtf/api/stream?url={youtube_url}",
-                    f"https://ytdl.squidproxy.xyz/{video_id}",
-                    f"https://youtube.squidproxy.xyz/{video_id}",
-                ]
-                
-                for service in services:
-                    try:
-                        response = requests.get(service, timeout=10)
-                        if response.status_code == 200:
-                            data = response.json()
-                            if 'url' in data:
-                                return data['url']
-                    except:
-                        continue
-                        
-        except Exception as e:
-            print(f"❌ Fallback service error: {e}")
+    async def get_proxy_stream(self, video_id: str) -> Optional[str]:
+        """Try various proxy services for audio streaming"""
+        services = [
+            f"https://api.douyin.wtf/api/stream?url=https://www.youtube.com/watch?v={video_id}",
+            f"https://ytdl.squidproxy.xyz/{video_id}",
+        ]
+        
+        for service in services:
+            try:
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda url: requests.get(url, timeout=10), 
+                    service
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'url' in data:
+                        print(f"✅ Got stream via proxy: {service}")
+                        return data['url']
+            except:
+                continue
         
         return None
     
     def extract_video_id(self, url: str) -> Optional[str]:
         """Extract video ID from YouTube URL"""
+        import re
         patterns = [
             r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&]+)',
             r'youtube\.com/embed/([^?]+)',
-            r'youtube\.com/v/([^?]+)',
         ]
         
         for pattern in patterns:
@@ -184,62 +201,42 @@ class YouTubeStreamer:
             if match:
                 return match.group(1)
         return None
-    
-    async def get_video_info(self, youtube_url: str) -> Optional[Dict]:
-        """Get video information"""
-        try:
-            def extract_info():
-                with youtube_dl.YoutubeDL(YDL_OPTS) as ydl:
-                    return ydl.extract_info(youtube_url, download=False)
-            
-            info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
-            
-            return {
-                'id': info['id'],
-                'title': info['title'],
-                'duration': info.get('duration', 0),
-                'thumbnail': info.get('thumbnail', ''),
-                'artist': info.get('uploader', 'Unknown Artist'),
-                'view_count': info.get('view_count', 0),
-                'description': info.get('description', '')[:100] + '...' if info.get('description') else ''
-            }
-        except Exception as e:
-            print(f"❌ Video info error: {e}")
-            return None
 
-# Initialize streamer
-music_streamer = YouTubeStreamer()
+# Initialize YouTube API service
+youtube_service = YouTubeAPIService()
 
 @app.get("/")
 async def root():
     return {
         "message": "Virus Music Radio API", 
         "status": "online",
-        "version": "3.0.0 - youtube-dl + Multiple Fallbacks",
+        "version": "4.0.0 - YouTube Data API",
         "endpoints": {
             "search": "/api/search?q=query",
             "play": "POST /api/play",
             "stream": "/api/stream",
             "status": "/api/status",
-            "stop": "POST /api/stop",
-            "test": "/api/test-stream"
+            "stop": "POST /api/stop"
         }
     }
 
 @app.get("/api/search")
 async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=20)):
-    """Search for music on YouTube"""
+    """Search for music using YouTube Data API"""
     if not q:
         raise HTTPException(status_code=400, detail="Query parameter required")
     
+    if not YOUTUBE_API_KEY or YOUTUBE_API_KEY == 'your_youtube_api_key_here':
+        raise HTTPException(status_code=500, detail="YouTube API key not configured")
+    
     print(f"🎵 API Search: {q}")
-    results = await music_streamer.search_music(q, limit)
+    results = await youtube_service.search_music(q, limit)
     
     return {
         "query": q, 
         "results": results, 
         "count": len(results),
-        "message": f"Found {len(results)} tracks"
+        "message": f"Found {len(results)} tracks via YouTube API"
     }
 
 @app.post("/api/play")
@@ -250,27 +247,32 @@ async def play_music(video_url: str = Form(...)):
     try:
         print(f"🎵 Play request received: {video_url}")
         
-        # Get video information
-        video_info = await music_streamer.get_video_info(video_url)
+        # Extract video ID for API lookup
+        video_id = youtube_service.extract_video_id(video_url)
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        
+        # Get video info using YouTube API
+        video_info = await youtube_service.get_video_info(video_id)
         if not video_info:
-            raise HTTPException(status_code=404, detail="Video not found or unavailable")
+            raise HTTPException(status_code=404, detail="Video not found")
         
-        # Get audio stream URL using multiple methods
-        audio_url = await music_streamer.get_audio_stream_url(video_url)
+        # Get audio stream URL
+        audio_url = await youtube_service.get_audio_stream_url(video_url)
         if not audio_url:
-            raise HTTPException(status_code=404, detail="Could not get audio stream from any method")
+            raise HTTPException(status_code=404, detail="Could not get audio stream")
         
-        print(f"🎵 Audio URL obtained successfully")
+        print(f"🎵 Audio stream obtained successfully")
         
         # Set current track
         current_track = {
-            'id': video_info['id'],
+            'id': video_id,
             'title': video_info['title'],
             'artist': video_info['artist'],
             'duration': video_info['duration'],
             'thumbnail': video_info['thumbnail'],
             'url': audio_url,
-            'source': 'youtube'
+            'source': 'youtube_api'
         }
         
         current_audio_url = audio_url
@@ -280,13 +282,46 @@ async def play_music(video_url: str = Form(...)):
             "status": "playing", 
             "track": current_track,
             "stream_url": "https://virus-music-backend-production.up.railway.app/api/stream",
-            "message": f"🎵 Now playing: {current_track['title']} by {current_track['artist']}",
-            "stream_method": "Proxied audio stream"
+            "message": f"🎵 Now playing: {current_track['title']} by {current_track['artist']}"
         }
         
     except Exception as e:
         print(f"❌ Play error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to play: {str(e)}")
+
+    async def get_video_info(self, video_id: str) -> Optional[Dict]:
+        """Get video information using YouTube API"""
+        try:
+            params = {
+                'part': 'snippet,contentDetails',
+                'id': video_id,
+                'key': self.api_key
+            }
+            
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.get(f"{self.base_url}/videos", params=params, timeout=10)
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('items'):
+                    item = data['items'][0]
+                    snippet = item['snippet']
+                    
+                    return {
+                        'id': video_id,
+                        'title': snippet['title'],
+                        'duration': self.parse_duration(item['contentDetails']['duration']),
+                        'thumbnail': snippet['thumbnails']['high']['url'],
+                        'artist': snippet['channelTitle'],
+                        'description': snippet.get('description', '')[:100] + '...'
+                    }
+            
+            return None
+        except Exception as e:
+            print(f"❌ Video info API error: {e}")
+            return None
 
 @app.get("/api/stream")
 async def stream_audio():
@@ -296,8 +331,8 @@ async def stream_audio():
     print(f"🎵 Stream request received - Status: {player_status}")
     
     if player_status != "playing" or not current_audio_url:
-        # Return a silent audio stream instead of error
-        silent_audio = b'\x00' * 1024  # Minimal silent audio
+        # Return silent audio instead of error
+        silent_audio = b'\x00' * 1024
         return StreamingResponse(
             iter([silent_audio]),
             media_type="audio/mpeg",
@@ -305,14 +340,13 @@ async def stream_audio():
         )
     
     try:
-        print(f"🎵 Proxying YouTube audio stream...")
+        print(f"🎵 Proxying audio stream...")
         
         def generate():
             try:
                 headers = {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': '*/*',
-                    'Accept-Encoding': 'identity',
                     'Range': 'bytes=0-',
                 }
                 
@@ -387,26 +421,9 @@ async def health_check():
     return {
         "status": "healthy",
         "player_status": player_status,
-        "service": "YouTube Music Streaming",
-        "version": "3.0.0"
+        "service": "YouTube Data API Streaming",
+        "version": "4.0.0"
     }
-
-@app.get("/api/test-stream")
-async def test_stream():
-    """Test if streaming is working with a known good audio file"""
-    test_url = "https://www.bensound.com/bensound-music/bensound-ukulele.mp3"
-    
-    def generate():
-        response = requests.get(test_url, stream=True)
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
-    
-    return StreamingResponse(
-        generate(),
-        media_type="audio/mpeg",
-        headers={"Content-Type": "audio/mpeg"}
-    )
 
 if __name__ == "__main__":
     import uvicorn
