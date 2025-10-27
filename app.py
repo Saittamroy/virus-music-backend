@@ -6,6 +6,9 @@ import os
 import asyncio
 from typing import Dict, List, Optional
 import re
+import random
+from collections import deque
+import time
 
 app = FastAPI(title="Virus Music Radio API", version="4.2.0")
 
@@ -21,10 +24,22 @@ app.add_middleware(
 current_track = None
 player_status = "stopped"
 current_audio_url = None
+play_queue = deque()
+is_random_playing = False
+random_playlist = []
 
 # YouTube Data API configuration
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
+
+# Bollywood club songs for random playback
+BOLYWOOD_CLUB_SONGS = [
+    "Bollywood club mix 2024",
+    "Bollywood dance songs 2024",
+    "Bollywood remix songs",
+    "Bollywood party songs",
+    "Bollywood club hits"
+]
 
 # -----------------------------
 # 🎵 YouTube API Service Class
@@ -225,6 +240,119 @@ class YouTubeAPIService:
 youtube_service = YouTubeAPIService()
 
 # -----------------------------
+# 🎧 Queue Management Functions
+# -----------------------------
+
+async def add_to_queue(video_url: str, requested_by: str = "Unknown"):
+    """Add song to queue"""
+    try:
+        video_id = youtube_service.extract_video_id(video_url)
+        if not video_id:
+            return {"success": False, "error": "Invalid URL"}
+
+        video_info = await youtube_service.get_video_info(video_id)
+        if not video_info:
+            return {"success": False, "error": "Video not found"}
+
+        queue_item = {
+            **video_info,
+            "url": video_url,
+            "requested_by": requested_by,
+            "added_at": time.time()
+        }
+
+        play_queue.append(queue_item)
+        position = len(play_queue)
+        
+        return {
+            "success": True, 
+            "position": position,
+            "track": queue_item
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+async def play_next_in_queue():
+    """Play next song in queue"""
+    global current_track, player_status, current_audio_url, is_random_playing
+    
+    if play_queue:
+        next_track = play_queue.popleft()
+        try:
+            audio_url = await youtube_service.get_audio_stream_url(next_track['url'])
+            if audio_url:
+                current_track = {**next_track, "audio_url": audio_url}
+                current_audio_url = audio_url
+                player_status = "playing"
+                is_random_playing = False
+                print(f"🎵 Now playing from queue: {current_track['title']}")
+                return True
+        except Exception as e:
+            print(f"Queue play error: {e}")
+    
+    # Start random if no queue
+    await start_random_playback()
+    return False
+
+async def start_random_playback():
+    """Start random Bollywood songs"""
+    global current_track, player_status, current_audio_url, is_random_playing, random_playlist
+    
+    if not random_playlist:
+        random_playlist = BOLYWOOD_CLUB_SONGS.copy()
+        random.shuffle(random_playlist)
+    
+    if not random_playlist:
+        return
+    
+    search_query = random_playlist.pop(0)
+    if not random_playlist:
+        random_playlist = BOLYWOOD_CLUB_SONGS.copy()
+        random.shuffle(random_playlist)
+    
+    try:
+        print(f"🎲 Searching random: {search_query}")
+        results = await youtube_service.search_music(search_query, limit=1)
+        if results:
+            random_track = results[0]
+            audio_url = await youtube_service.get_audio_stream_url(random_track['url'])
+            
+            if audio_url:
+                current_track = {
+                    **random_track,
+                    "audio_url": audio_url,
+                    "requested_by": "Auto DJ",
+                    "is_random": True
+                }
+                current_audio_url = audio_url
+                player_status = "playing"
+                is_random_playing = True
+                print(f"🎲 Now playing random: {current_track['title']}")
+    except Exception as e:
+        print(f"Random playback error: {e}")
+
+async def skip_current_track():
+    """Skip current track"""
+    global current_track, player_status, current_audio_url
+    
+    if play_queue:
+        await play_next_in_queue()
+        return {"success": True, "message": "Skipped to next in queue"}
+    elif is_random_playing:
+        await start_random_playback()
+        return {"success": True, "message": "Skipped to next random song"}
+    else:
+        current_track = None
+        player_status = "stopped"
+        current_audio_url = None
+        return {"success": True, "message": "Stopped - no more songs"}
+
+# Start random playback on startup
+@app.on_event("startup")
+async def startup_event():
+    await start_random_playback()
+
+# -----------------------------
 # 🎧 FastAPI Endpoints
 # -----------------------------
 
@@ -251,10 +379,31 @@ async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10,
     return {"query": q, "results": results, "count": len(results)}
 
 @app.post("/api/play")
-async def play_music(video_url: str = Form(...)):
-    global current_track, player_status, current_audio_url
+async def play_music(video_url: str = Form(...), requested_by: str = Form("Unknown")):
+    global current_track, player_status, current_audio_url, is_random_playing
+    
     try:
-        print(f"🎵 Play request: {video_url}")
+        print(f"🎵 Play request from {requested_by}: {video_url}")
+        
+        # If random is playing, stop it and play requested song immediately
+        if is_random_playing:
+            play_queue.clear()
+            is_random_playing = False
+        
+        # If something is playing, add to queue
+        if player_status == "playing" and current_track:
+            result = await add_to_queue(video_url, requested_by)
+            if result["success"]:
+                return {
+                    "status": "queued",
+                    "position": result["position"],
+                    "track": result["track"],
+                    "message": f"🎵 Added to queue (position {result['position']}): {result['track']['title']}"
+                }
+            else:
+                raise HTTPException(status_code=400, detail=result["error"])
+        
+        # Play immediately
         video_id = youtube_service.extract_video_id(video_url)
         if not video_id:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL")
@@ -267,9 +416,16 @@ async def play_music(video_url: str = Form(...)):
         if not audio_url:
             raise HTTPException(status_code=404, detail="No audio stream found")
 
-        current_track = {**video_info, "url": audio_url, "source": "youtube_api"}
+        current_track = {
+            **video_info,
+            "url": video_url,
+            "audio_url": audio_url,
+            "requested_by": requested_by,
+            "source": 'youtube_api'
+        }
         current_audio_url = audio_url
         player_status = "playing"
+        is_random_playing = False
 
         return {
             "status": "playing",
@@ -282,13 +438,45 @@ async def play_music(video_url: str = Form(...)):
         print(f"❌ Play error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# New endpoints for queue management
+@app.post("/api/queue")
+async def add_to_queue_endpoint(video_url: str = Form(...), requested_by: str = Form("Unknown")):
+    result = await add_to_queue(video_url, requested_by)
+    if result["success"]:
+        return {
+            "status": "queued",
+            "position": result["position"],
+            "track": result["track"],
+            "queue_length": len(play_queue)
+        }
+    else:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+@app.post("/api/skip")
+async def skip_track():
+    result = await skip_current_track()
+    return result
+
+@app.get("/api/queue")
+async def get_queue_status():
+    return {
+        "current_track": current_track,
+        "queue": list(play_queue),
+        "queue_length": len(play_queue),
+        "is_random_playing": is_random_playing
+    }
+
 @app.get("/api/stream")
 async def stream_audio():
     global current_audio_url, player_status
 
     if player_status != "playing" or not current_audio_url:
-        silent_audio = b'\x00' * 1024
-        return StreamingResponse(iter([silent_audio]), media_type="audio/mpeg")
+        if not await play_next_in_queue():
+            await start_random_playback()
+        
+        if not current_audio_url:
+            silent_audio = b'\x00' * 1024
+            return StreamingResponse(iter([silent_audio]), media_type="audio/mpeg")
 
     try:
         def generate():
@@ -300,25 +488,35 @@ async def stream_audio():
                 }
                 response = requests.get(current_audio_url, stream=True, timeout=30, headers=headers)
                 response.raise_for_status()
+                
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         yield chunk
+                    else:
+                        break
+                
+                # Song ended, play next
+                asyncio.create_task(play_next_in_queue())
+                
             except Exception as e:
-                print(f"❌ Stream error: {e}")
+                print(f"Stream error: {e}")
+                asyncio.create_task(play_next_in_queue())
                 yield b'\x00' * 8192
 
         return StreamingResponse(generate(), media_type="audio/mpeg", headers={"Access-Control-Allow-Origin": "*"})
 
     except Exception as e:
-        print(f"❌ Stream proxy error: {e}")
+        print(f"Stream proxy error: {e}")
         return StreamingResponse(iter([b'\x00' * 1024]), media_type="audio/mpeg")
 
 @app.post("/api/stop")
 async def stop_music():
-    global current_track, player_status, current_audio_url
+    global current_track, player_status, current_audio_url, play_queue, is_random_playing
     current_track = None
     player_status = "stopped"
     current_audio_url = None
+    play_queue.clear()
+    is_random_playing = False
     print("🛑 Music stopped")
     return {"status": "stopped"}
 
