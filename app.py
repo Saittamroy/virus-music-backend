@@ -22,11 +22,13 @@ app.add_middleware(
 
 # Global state
 current_track = None
-player_status = "stopped"
+player_status = "playing"  # Always playing
 current_audio_url = None
 play_queue = deque()
 is_random_playing = False
 random_playlist = []
+stream_start_time = 0
+current_track_start_time = 0
 
 # YouTube Data API configuration
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
@@ -274,7 +276,7 @@ async def add_to_queue(video_url: str, requested_by: str = "Unknown"):
 
 async def play_next_in_queue():
     """Play next song in queue"""
-    global current_track, player_status, current_audio_url, is_random_playing
+    global current_track, current_audio_url, is_random_playing, current_track_start_time
     
     if play_queue:
         next_track = play_queue.popleft()
@@ -283,8 +285,8 @@ async def play_next_in_queue():
             if audio_url:
                 current_track = {**next_track, "audio_url": audio_url}
                 current_audio_url = audio_url
-                player_status = "playing"
                 is_random_playing = False
+                current_track_start_time = time.time()
                 print(f"🎵 Now playing from queue: {current_track['title']}")
                 return True
         except Exception as e:
@@ -296,7 +298,7 @@ async def play_next_in_queue():
 
 async def start_random_playback():
     """Start random Bollywood songs"""
-    global current_track, player_status, current_audio_url, is_random_playing, random_playlist
+    global current_track, current_audio_url, is_random_playing, random_playlist, current_track_start_time
     
     if not random_playlist:
         random_playlist = BOLYWOOD_CLUB_SONGS.copy()
@@ -325,15 +327,15 @@ async def start_random_playback():
                     "is_random": True
                 }
                 current_audio_url = audio_url
-                player_status = "playing"
                 is_random_playing = True
+                current_track_start_time = time.time()
                 print(f"🎲 Now playing random: {current_track['title']}")
     except Exception as e:
         print(f"Random playback error: {e}")
 
 async def skip_current_track():
     """Skip current track"""
-    global current_track, player_status, current_audio_url
+    global current_track, current_audio_url
     
     if play_queue:
         await play_next_in_queue()
@@ -342,14 +344,14 @@ async def skip_current_track():
         await start_random_playback()
         return {"success": True, "message": "Skipped to next random song"}
     else:
-        current_track = None
-        player_status = "stopped"
-        current_audio_url = None
-        return {"success": True, "message": "Stopped - no more songs"}
+        await start_random_playback()
+        return {"success": True, "message": "Skipped to random song"}
 
 # Start random playback on startup
 @app.on_event("startup")
 async def startup_event():
+    global stream_start_time
+    stream_start_time = time.time()
     await start_random_playback()
 
 # -----------------------------
@@ -367,7 +369,7 @@ async def root():
             "play": "POST /api/play",
             "stream": "/api/stream",
             "status": "/api/status",
-            "stop": "POST /api/stop"
+            "skip": "POST /api/skip"
         }
     }
 
@@ -380,7 +382,7 @@ async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10,
 
 @app.post("/api/play")
 async def play_music(video_url: str = Form(...), requested_by: str = Form("Unknown")):
-    global current_track, player_status, current_audio_url, is_random_playing
+    global current_track, current_audio_url, is_random_playing
     
     try:
         print(f"🎵 Play request from {requested_by}: {video_url}")
@@ -391,7 +393,7 @@ async def play_music(video_url: str = Form(...), requested_by: str = Form("Unkno
             is_random_playing = False
         
         # If something is playing, add to queue
-        if player_status == "playing" and current_track:
+        if current_track:
             result = await add_to_queue(video_url, requested_by)
             if result["success"]:
                 return {
@@ -403,7 +405,7 @@ async def play_music(video_url: str = Form(...), requested_by: str = Form("Unkno
             else:
                 raise HTTPException(status_code=400, detail=result["error"])
         
-        # Play immediately
+        # Play immediately (if nothing is playing)
         video_id = youtube_service.extract_video_id(video_url)
         if not video_id:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL")
@@ -424,7 +426,6 @@ async def play_music(video_url: str = Form(...), requested_by: str = Form("Unkno
             "source": 'youtube_api'
         }
         current_audio_url = audio_url
-        player_status = "playing"
         is_random_playing = False
 
         return {
@@ -468,13 +469,15 @@ async def get_queue_status():
 
 @app.get("/api/stream")
 async def stream_audio():
-    global current_audio_url, player_status
+    global current_audio_url
 
-    if player_status != "playing" or not current_audio_url:
+    if not current_audio_url:
+        # If no audio URL, try to get one
         if not await play_next_in_queue():
             await start_random_playback()
         
         if not current_audio_url:
+            # Return silent audio if still no stream
             silent_audio = b'\x00' * 1024
             return StreamingResponse(iter([silent_audio]), media_type="audio/mpeg")
 
@@ -484,62 +487,76 @@ async def stream_audio():
                 headers = {
                     'User-Agent': 'Mozilla/5.0',
                     'Accept': '*/*',
-                    'Range': 'bytes=0-',
                 }
+                # Stream the audio continuously
                 response = requests.get(current_audio_url, stream=True, timeout=30, headers=headers)
                 response.raise_for_status()
                 
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         yield chunk
-                    else:
-                        break
                 
                 # Song ended, play next
+                print("🎵 Song ended, playing next...")
                 asyncio.create_task(play_next_in_queue())
                 
             except Exception as e:
                 print(f"Stream error: {e}")
+                # Try to play next song on error
                 asyncio.create_task(play_next_in_queue())
+                # Return silent audio temporarily
                 yield b'\x00' * 8192
 
-        return StreamingResponse(generate(), media_type="audio/mpeg", headers={"Access-Control-Allow-Origin": "*"})
+        return StreamingResponse(
+            generate(), 
+            media_type="audio/mpeg", 
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+        )
 
     except Exception as e:
         print(f"Stream proxy error: {e}")
+        # Return silent audio and try to recover
+        asyncio.create_task(play_next_in_queue())
         return StreamingResponse(iter([b'\x00' * 1024]), media_type="audio/mpeg")
 
+# Remove stop endpoint since music never stops
 @app.post("/api/stop")
 async def stop_music():
-    global current_track, player_status, current_audio_url, play_queue, is_random_playing
-    current_track = None
-    player_status = "stopped"
-    current_audio_url = None
-    play_queue.clear()
-    is_random_playing = False
-    print("🛑 Music stopped")
-    return {"status": "stopped"}
+    """Stop is disabled - music always plays"""
+    return {"status": "error", "message": "Music cannot be stopped - this is a live radio stream"}
 
 @app.get("/api/status")
 async def get_player_status():
+    current_time = time.time()
+    track_progress = current_time - current_track_start_time if current_track_start_time > 0 else 0
+    
     return {
-        "status": player_status,
+        "status": "playing",  # Always playing
         "current_track": current_track,
-        "stream_active": player_status == "playing"
+        "track_progress": track_progress,
+        "is_random_playing": is_random_playing,
+        "queue_length": len(play_queue),
+        "stream_active": True  # Always active
     }
 
 @app.get("/api/radio/url")
 async def get_radio_url():
     return {
         "radio_url": "https://virus-music-backend-production.up.railway.app/api/stream",
-        "status": player_status,
-        "current_track": current_track['title'] if current_track else 'No track playing',
-        "artist": current_track['artist'] if current_track else 'None',
+        "status": "playing",
+        "current_track": current_track['title'] if current_track else 'Auto DJ - Bollywood Mix',
+        "artist": current_track['artist'] if current_track else 'Various Artists',
+        "is_live": True
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "4.2.0"}
+    return {"status": "healthy", "version": "4.2.0", "stream_active": True}
 
 if __name__ == "__main__":
     import uvicorn
