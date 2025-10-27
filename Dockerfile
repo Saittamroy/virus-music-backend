@@ -1,14 +1,14 @@
 FROM python:3.11-slim
 
-# Install FFmpeg for audio processing
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    icecast2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /app
 
-# Copy Python requirements
+# Copy requirements
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
