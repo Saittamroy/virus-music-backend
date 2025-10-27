@@ -1,13 +1,13 @@
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-import aiohttp
+from fastapi.responses import RedirectResponse, JSONResponse
+import yt_dlp
+import asyncio
 import os
-from typing import Dict, List
-import json
-import requests
+from typing import Dict, List, Optional
+import uuid
 
-app = FastAPI(title="Virus Music Radio API")
+app = FastAPI(title="Virus Music Radio API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,219 +21,172 @@ current_track = None
 player_status = "stopped"
 current_audio_url = None
 
-class MusicStreamer:
+# yt-dlp configuration
+YDL_OPTS = {
+    'format': 'bestaudio/best',
+    'extractaudio': True,
+    'audioformat': 'mp3',
+    'outtmpl': 'downloads/%(title)s.%(ext)s',
+    'noplaylist': True,
+    'quiet': False,
+    'no_warnings': False,
+}
+
+class YouTubeStreamer:
     def __init__(self):
         pass
     
-    async def search_music(self, query: str) -> List[Dict]:
-        """Search music using Invidious API (YouTube alternative)"""
+    async def search_music(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search for music using yt-dlp"""
         try:
             print(f"🔍 Searching for: {query}")
             
-            # Use Invidious API instead of YouTube directly
-            invidious_instances = [
-                "https://inv.tux.pizza",
-                "https://invidious.snopyta.org", 
-                "https://yewtu.be"
-            ]
+            def sync_search():
+                with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+                    info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                    return info.get('entries', [])
             
-            for instance in invidious_instances:
-                try:
-                    search_url = f"{instance}/api/v1/search?q={query}&type=video"
-                    response = requests.get(search_url, timeout=10)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        results = []
-                        
-                        for video in data[:5]:  # Top 5 results
-                            results.append({
-                                'id': video['videoId'],
-                                'title': video['title'],
-                                'url': f"https://www.youtube.com/watch?v={video['videoId']}",
-                                'duration': video.get('lengthSeconds', 0),
-                                'thumbnail': video.get('videoThumbnails', [{}])[0].get('url', ''),
-                                'artist': video.get('author', 'Unknown Artist'),
-                                'source': 'invidious'
-                            })
-                        
-                        if results:
-                            print(f"✅ Found {len(results)} results via {instance}")
-                            return results
-                            
-                except Exception as e:
-                    print(f"❌ Invidious instance {instance} failed: {e}")
-                    continue
+            results = await asyncio.get_event_loop().run_in_executor(None, sync_search)
+            formatted_results = []
             
-            # Fallback to curated music if all Invidious instances fail
-            return self._get_curated_music(query)
+            for video in results:
+                if video:
+                    formatted_results.append({
+                        'id': video['id'],
+                        'title': video['title'],
+                        'url': video['webpage_url'],
+                        'duration': video.get('duration', 0),
+                        'thumbnail': video.get('thumbnail', ''),
+                        'artist': video.get('uploader', 'Unknown Artist'),
+                        'view_count': video.get('view_count', 0),
+                        'source': 'youtube'
+                    })
+            
+            print(f"✅ Found {len(formatted_results)} results")
+            return formatted_results
             
         except Exception as e:
             print(f"❌ Search error: {e}")
-            return self._get_curated_music(query)
+            return []
     
-    def _get_curated_music(self, query: str) -> List[Dict]:
-        """Curated list of free music that always works"""
-        curated_music = [
-            {
-                'id': 'bensound1',
-                'title': 'Acoustic Breeze',
-                'artist': 'Bensound',
-                'duration': 157,
-                'thumbnail': '',
-                'url': 'https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3',
-                'source': 'bensound'
-            },
-            {
-                'id': 'bensound2',
-                'title': 'Better Days',
-                'artist': 'Bensound',
-                'duration': 188,
-                'thumbnail': '',
-                'url': 'https://www.bensound.com/bensound-music/bensound-betterdays.mp3',
-                'source': 'bensound'
-            },
-            {
-                'id': 'bensound3',
-                'title': 'Happy Rock',
-                'artist': 'Bensound',
-                'duration': 167,
-                'thumbnail': '',
-                'url': 'https://www.bensound.com/bensound-music/bensound-happyrock.mp3',
-                'source': 'bensound'
-            },
-            {
-                'id': 'soundjay1',
-                'title': 'Summer Walk',
-                'artist': 'Background Music',
-                'duration': 180,
-                'thumbnail': '',
-                'url': 'https://www.soundjay.com/music/summer-walk-01.mp3',
-                'source': 'soundjay'
-            }
-        ]
-        
-        # Filter by query if provided
-        if query and query.strip():
-            filtered = [track for track in curated_music 
-                       if query.lower() in track['title'].lower() or 
-                          query.lower() in track['artist'].lower()]
-            return filtered if filtered else curated_music
-        
-        return curated_music
-    
-    async def get_track_by_url(self, video_url: str) -> Dict:
-        """Get track information by URL - FIXED VERSION"""
+    async def get_audio_stream_url(self, youtube_url: str) -> Optional[str]:
+        """Get direct audio stream URL for playback"""
         try:
-            print(f"🎵 Looking up track by URL: {video_url}")
+            print(f"🎵 Getting audio URL for: {youtube_url}")
             
-            # For curated music URLs, return the track directly
-            curated_tracks = self._get_curated_music("")
-            for track in curated_tracks:
-                if track['url'] == video_url:
-                    print(f"✅ Found curated track: {track['title']}")
-                    return track
+            def extract_info():
+                with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+                    return ydl.extract_info(youtube_url, download=False)
             
-            # For YouTube URLs, extract video ID and search
-            if 'youtube.com' in video_url or 'youtu.be' in video_url:
-                video_id = None
-                if 'youtube.com/watch?v=' in video_url:
-                    video_id = video_url.split('youtube.com/watch?v=')[1].split('&')[0]
-                elif 'youtu.be/' in video_url:
-                    video_id = video_url.split('youtu.be/')[1].split('?')[0]
-                
-                if video_id:
-                    # Search for this specific video
-                    invidious_instances = [
-                        "https://inv.tux.pizza",
-                        "https://invidious.snopyta.org", 
-                        "https://yewtu.be"
-                    ]
-                    
-                    for instance in invidious_instances:
-                        try:
-                            video_url = f"{instance}/api/v1/videos/{video_id}"
-                            response = requests.get(video_url, timeout=10)
-                            
-                            if response.status_code == 200:
-                                video_data = response.json()
-                                track_info = {
-                                    'id': video_data['videoId'],
-                                    'title': video_data['title'],
-                                    'url': f"https://www.youtube.com/watch?v={video_data['videoId']}",
-                                    'duration': video_data.get('lengthSeconds', 0),
-                                    'thumbnail': video_data.get('videoThumbnails', [{}])[3].get('url', ''),
-                                    'artist': video_data.get('author', 'Unknown Artist'),
-                                    'source': 'invidious'
-                                }
-                                print(f"✅ Found YouTube track: {track_info['title']}")
-                                return track_info
-                                
-                        except Exception as e:
-                            print(f"❌ Invidious instance {instance} failed: {e}")
-                            continue
+            info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
             
-            # Final fallback - return first curated track
-            fallback_track = curated_tracks[0]
-            print(f"⚠️ Using fallback track: {fallback_track['title']}")
-            return fallback_track
+            # Get the best audio URL
+            if 'url' in info:
+                print(f"✅ Got direct audio URL")
+                return info['url']
+            
+            # Fallback: find best audio format
+            if 'formats' in info:
+                audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
+                if audio_formats:
+                    best_audio = max(audio_formats, key=lambda x: x.get('quality', 0))
+                    print(f"✅ Got audio format URL")
+                    return best_audio['url']
+            
+            return None
             
         except Exception as e:
-            print(f"❌ Track lookup error: {e}")
-            curated_tracks = self._get_curated_music("")
-            return curated_tracks[0]
+            print(f"❌ Audio URL extraction error: {e}")
+            return None
+    
+    async def get_video_info(self, youtube_url: str) -> Optional[Dict]:
+        """Get video information"""
+        try:
+            def extract_info():
+                with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+                    return ydl.extract_info(youtube_url, download=False)
+            
+            info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
+            
+            return {
+                'id': info['id'],
+                'title': info['title'],
+                'duration': info.get('duration', 0),
+                'thumbnail': info.get('thumbnail', ''),
+                'artist': info.get('uploader', 'Unknown Artist'),
+                'view_count': info.get('view_count', 0),
+                'description': info.get('description', '')[:100] + '...' if info.get('description') else ''
+            }
+        except Exception as e:
+            print(f"❌ Video info error: {e}")
+            return None
 
-music_streamer = MusicStreamer()
+# Initialize streamer
+music_streamer = YouTubeStreamer()
 
 @app.get("/")
 async def root():
     return {
         "message": "Virus Music Radio API", 
         "status": "online",
-        "version": "6.1.0 - Fixed Track Selection"
+        "version": "2.0.0 - YouTube Streaming",
+        "endpoints": {
+            "search": "/api/search?q=query",
+            "play": "POST /api/play",
+            "stream": "/api/stream",
+            "status": "/api/status",
+            "stop": "POST /api/stop"
+        }
     }
 
 @app.get("/api/search")
-async def search_music(q: str):
-    """Search for music - always returns results"""
+async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=20)):
+    """Search for music on YouTube"""
     if not q:
         raise HTTPException(status_code=400, detail="Query parameter required")
     
     print(f"🎵 API Search: {q}")
-    results = await music_streamer.search_music(q)
+    results = await music_streamer.search_music(q, limit)
     
     return {
         "query": q, 
         "results": results, 
-        "message": f"Found {len(results)} tracks",
-        "source": "invidious+curated"
+        "count": len(results),
+        "message": f"Found {len(results)} tracks"
     }
 
 @app.post("/api/play")
 async def play_music(video_url: str = Form(...)):
-    """Play music - FIXED VERSION that properly selects requested track"""
+    """Play music from YouTube URL"""
     global current_track, player_status, current_audio_url
     
     try:
         print(f"🎵 Play request received: {video_url}")
         
-        # Get the actual track info for the requested URL
-        track_info = await music_streamer.get_track_by_url(video_url)
+        # Get video information
+        video_info = await music_streamer.get_video_info(video_url)
+        if not video_info:
+            raise HTTPException(status_code=404, detail="Video not found or unavailable")
         
-        print(f"🎵 Selected track: {track_info['title']}")
+        # Get audio stream URL
+        audio_url = await music_streamer.get_audio_stream_url(video_url)
+        if not audio_url:
+            raise HTTPException(status_code=404, detail="Could not get audio stream")
+        
+        print(f"🎵 Audio URL obtained: {audio_url[:100]}...")
         
         # Set current track
         current_track = {
-            'id': track_info['id'],
-            'title': track_info['title'],
-            'artist': track_info.get('artist', 'Unknown Artist'),
-            'duration': track_info['duration'],
-            'thumbnail': track_info.get('thumbnail', ''),
-            'url': track_info['url'],  # Use the actual URL
-            'source': track_info.get('source', 'direct')
+            'id': video_info['id'],
+            'title': video_info['title'],
+            'artist': video_info['artist'],
+            'duration': video_info['duration'],
+            'thumbnail': video_info['thumbnail'],
+            'url': audio_url,
+            'source': 'youtube'
         }
         
-        current_audio_url = track_info['url']  # Use the actual audio URL
+        current_audio_url = audio_url
         player_status = "playing"
         
         # Get stream URL for Highrise
@@ -249,26 +202,28 @@ async def play_music(video_url: str = Form(...)):
         
     except Exception as e:
         print(f"❌ Play error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to start stream")
+        raise HTTPException(status_code=500, detail=f"Failed to play: {str(e)}")
 
 @app.get("/api/stream")
 async def stream_audio():
-    """Redirect to audio stream - always works"""
+    """Stream audio - redirects to YouTube audio stream"""
     global current_audio_url, player_status
     
+    print(f"🎵 Stream request received - Status: {player_status}")
+    
     if player_status == "playing" and current_audio_url:
-        print(f"🎵 Streaming: {current_audio_url}")
+        print(f"🎵 Redirecting to audio stream: {current_audio_url[:100]}...")
         return RedirectResponse(url=current_audio_url)
     else:
-        # Always return a working audio stream
-        default_url = "https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3"
-        print(f"🎵 Streaming default: {default_url}")
-        return RedirectResponse(url=default_url)
+        # Return error instead of default stream
+        raise HTTPException(status_code=404, detail="No active stream. Please play a song first.")
 
 @app.post("/api/stop")
 async def stop_music():
     """Stop music streaming"""
     global current_track, player_status, current_audio_url
+    
+    print(f"🎵 Stop request received")
     
     current_track = None
     player_status = "stopped"
@@ -294,7 +249,8 @@ async def get_radio_url():
     return {
         "radio_url": stream_url,
         "status": player_status,
-        "current_track": current_track['title'] if current_track else 'Ready to play',
+        "current_track": current_track['title'] if current_track else 'No track playing',
+        "artist": current_track['artist'] if current_track else 'None',
         "instructions": "Add this URL to Highrise room music settings!"
     }
 
@@ -303,5 +259,20 @@ async def health_check():
     return {
         "status": "healthy",
         "player_status": player_status,
-        "sources": "invidious, bensound, soundjay"
+        "service": "YouTube Music Streaming",
+        "version": "2.0.0"
     }
+
+# Additional utility endpoints
+@app.get("/api/info")
+async def get_video_info(url: str = Query(...)):
+    """Get video information without playing"""
+    info = await music_streamer.get_video_info(url)
+    if not info:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return info
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
