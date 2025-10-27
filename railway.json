@@ -1,0 +1,21 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "sleepApplication": false,
+    "restartPolicyType": "ON_FAILURE",
+    "ports": [
+      {
+        "port": 8000,
+        "protocol": "TCP"
+      },
+      {
+        "port": 8001,
+        "protocol": "TCP"
+      }
+    ]
+  }
+}
