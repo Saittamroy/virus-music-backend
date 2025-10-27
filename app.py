@@ -1,18 +1,17 @@
-from fastapi import FastAPI, HTTPException, Form, Query
+from fastapi import FastAPI, HTTPException, Form, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import requests
 import os
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import re
-import random
-from collections import deque
+import aiohttp
 import time
+import json
 
 app = FastAPI(title="Virus Music Radio API", version="4.2.0")
 
-# Allow all origins (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,31 +19,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global state
-current_track = None
-player_status = "playing"  # Always playing
-current_audio_url = None
-play_queue = deque()
-is_random_playing = False
-random_playlist = []
-current_track_start_time = 0
-last_activity_time = 0
+# -------------------------
+# Global state (shared)
+# -------------------------
+current_track: Optional[Dict] = None
+player_status: str = "stopped"   # "playing" or "stopped"
+current_audio_url: Optional[str] = None
 
-# YouTube Data API configuration
+# A FIFO queue for user-requested tracks (each item is dict with keys: id, title, url, requested_by)
+request_queue: List[Dict] = []
+
+# Internal control objects
+_player_task: Optional[asyncio.Task] = None
+_player_loop_should_run = True
+
+# For broadcasting to connected /api/stream clients
+# Each client gets its own asyncio.Queue of bytes; the player loop puts bytes into all client queues
+_client_queues: Set[asyncio.Queue] = set()
+_client_queues_lock = asyncio.Lock()
+
+# Event used to interrupt current playback (for immediate skip when a requested song is queued)
+_skip_current = asyncio.Event()
+
+# YouTube API config
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
 
-# Bollywood club songs for random playback
-BOLYWOOD_CLUB_SONGS = [
-    "Bollywood club mix 2024",
-    "Bollywood dance songs 2024",
-    "Bollywood remix songs",
-    "Bollywood party songs",
-    "Bollywood club hits"
+# Predefined random Bollywood/club YouTube URLs (replace with your curated list)
+BOLLYWOOD_RANDOM_TRACKS = [
+    # Example YouTube watch URLs — replace or extend with your favorites
+    "https://www.youtube.com/watch?v=DWcJFNfaw9c",
+    "https://www.youtube.com/watch?v=kJQP7kiw5Fk",
+    "https://www.youtube.com/watch?v=2Vv-BfVoq4g",
+    "https://www.youtube.com/watch?v=jt2pF0rI8V0",
+    # Add many more to ensure continuous variety
 ]
 
 # -----------------------------
-# 🎵 YouTube API Service Class
+# YouTubeAPIService (keeps same interface)
 # -----------------------------
 class YouTubeAPIService:
     def __init__(self):
@@ -52,7 +64,6 @@ class YouTubeAPIService:
         self.base_url = YOUTUBE_API_URL
 
     async def search_music(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search for music videos using YouTube Data API."""
         try:
             print(f"🔍 Searching via YouTube API: {query}")
             params = {
@@ -63,23 +74,18 @@ class YouTubeAPIService:
                 'maxResults': limit,
                 'key': self.api_key
             }
-
             response = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: requests.get(f"{self.base_url}/search", params=params, timeout=10)
             )
-
             if response.status_code != 200:
                 print(f"❌ YouTube API Error: {response.status_code} - {response.text}")
                 return []
-
             data = response.json()
             results = []
-
             for item in data.get('items', []):
                 video_id = item['id']['videoId']
                 snippet = item['snippet']
                 duration = await self.get_video_duration(video_id)
-
                 results.append({
                     'id': video_id,
                     'title': snippet['title'],
@@ -89,40 +95,33 @@ class YouTubeAPIService:
                     'artist': snippet['channelTitle'],
                     'source': 'youtube_api'
                 })
-
             print(f"✅ Found {len(results)} results via YouTube API")
             return results
-
         except Exception as e:
             print(f"❌ YouTube API search error: {e}")
             return []
 
     async def get_video_duration(self, video_id: str) -> int:
-        """Get YouTube video duration in seconds."""
         try:
             params = {
                 'part': 'contentDetails',
                 'id': video_id,
                 'key': self.api_key
             }
-
             response = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: requests.get(f"{self.base_url}/videos", params=params, timeout=10)
             )
-
             if response.status_code == 200:
                 data = response.json()
                 if data.get('items'):
                     duration_str = data['items'][0]['contentDetails']['duration']
                     return self.parse_duration(duration_str)
-
             return 0
         except Exception as e:
             print(f"❌ Duration fetch error: {e}")
             return 0
 
     def parse_duration(self, duration: str) -> int:
-        """Convert ISO 8601 duration (e.g. PT4M13S) to seconds."""
         match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration)
         if not match:
             return 0
@@ -132,18 +131,15 @@ class YouTubeAPIService:
         return hours * 3600 + minutes * 60 + seconds
 
     async def get_video_info(self, video_id: str) -> Optional[Dict]:
-        """Fetch detailed video info."""
         try:
             params = {
                 'part': 'snippet,contentDetails',
                 'id': video_id,
                 'key': self.api_key
             }
-
             response = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: requests.get(f"{self.base_url}/videos", params=params, timeout=10)
             )
-
             if response.status_code == 200:
                 data = response.json()
                 if data.get('items'):
@@ -157,22 +153,19 @@ class YouTubeAPIService:
                         'artist': snippet['channelTitle'],
                         'description': snippet.get('description', '')[:100] + '...'
                     }
-
             return None
         except Exception as e:
             print(f"❌ Video info API error: {e}")
             return None
 
     async def get_audio_stream_url(self, youtube_url: str) -> Optional[str]:
-        """Try multiple methods to get audio stream URL."""
         try:
             video_id = self.extract_video_id(youtube_url)
             if not video_id:
                 return None
+            print(f"🎵 Getting audio stream for video: {video_id}")
 
-            print(f"🎵 Getting audio stream for: {video_id}")
-
-            # Try yt-dlp first
+            # Method 1: yt-dlp
             try:
                 import yt_dlp
                 ydl_opts = {
@@ -180,36 +173,42 @@ class YouTubeAPIService:
                     'quiet': True,
                     'noplaylist': True,
                 }
-
                 def extract_info():
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         return ydl.extract_info(youtube_url, download=False)
-
                 info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
-                if 'url' in info:
-                    print("✅ Stream via yt-dlp")
-                    return info['url']
+                # yt-dlp returns 'url' for direct format entries or 'formats' list; handle both
+                if isinstance(info, dict):
+                    # Prefer direct url key if present
+                    if 'url' in info:
+                        print("✅ Got stream via yt-dlp (info['url'])")
+                        return info['url']
+                    # else try formats
+                    formats = info.get('formats') or []
+                    if formats:
+                        # pick best audio with an url
+                        for f in reversed(formats):
+                            if f.get('acodec') != 'none' and f.get('url'):
+                                print("✅ Got stream via yt-dlp (formats)")
+                                return f['url']
             except Exception as e:
-                print(f"❌ yt-dlp failed: {e}")
+                print(f"❌ yt-dlp method failed: {e}")
 
-            # Try proxy service fallback
+            # Method 2: proxy
             proxy_url = await self.get_proxy_stream(video_id)
             if proxy_url:
                 return proxy_url
 
-            # Fallback audio
+            # fallback audio
             return "https://www.bensound.com/bensound-music/bensound-ukulele.mp3"
-
         except Exception as e:
             print(f"❌ Audio stream error: {e}")
             return "https://www.bensound.com/bensound-music/bensound-ukulele.mp3"
 
     async def get_proxy_stream(self, video_id: str) -> Optional[str]:
-        """Fallback proxy audio stream services."""
         services = [
             f"https://api.douyin.wtf/api/stream?url=https://www.youtube.com/watch?v={video_id}",
         ]
-
         for service in services:
             try:
                 response = await asyncio.get_event_loop().run_in_executor(
@@ -218,16 +217,14 @@ class YouTubeAPIService:
                 if response.status_code == 200:
                     data = response.json()
                     if 'url' in data:
-                        print(f"✅ Stream via proxy: {service}")
+                        print(f"✅ Got stream via proxy: {service}")
                         return data['url']
             except Exception as e:
-                print(f"❌ Proxy failed: {e}")
+                print(f"❌ Proxy {service} failed: {e}")
                 continue
-
         return None
 
     def extract_video_id(self, url: str) -> Optional[str]:
-        """Extract YouTube video ID from various URL formats."""
         patterns = [
             r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&?/]+)',
             r'youtube\.com/embed/([^?]+)',
@@ -238,188 +235,150 @@ class YouTubeAPIService:
                 return match.group(1)
         return None
 
-# Initialize YouTube service
+# Initialize youtube_service
 youtube_service = YouTubeAPIService()
 
 # -----------------------------
-# 🎧 Queue Management Functions
+# Helper functions for broadcasting
 # -----------------------------
+async def register_client_queue() -> asyncio.Queue:
+    q = asyncio.Queue(maxsize=32)
+    async with _client_queues_lock:
+        _client_queues.add(q)
+    return q
 
-async def add_to_queue(video_url: str, requested_by: str = "Unknown"):
-    """Add song to queue"""
-    try:
-        video_id = youtube_service.extract_video_id(video_url)
-        if not video_id:
-            return {"success": False, "error": "Invalid URL"}
+async def unregister_client_queue(q: asyncio.Queue):
+    async with _client_queues_lock:
+        if q in _client_queues:
+            _client_queues.remove(q)
 
-        video_info = await youtube_service.get_video_info(video_id)
-        if not video_info:
-            return {"success": False, "error": "Video not found"}
+async def broadcast_chunk(chunk: bytes):
+    """Push the same chunk to every connected client queue (drop if queue full)."""
+    async with _client_queues_lock:
+        for q in list(_client_queues):
+            try:
+                q.put_nowait(chunk)
+            except asyncio.QueueFull:
+                # If a client's buffer is full, drop this chunk for that client to avoid blocking
+                pass
 
-        queue_item = {
-            **video_info,
-            "url": video_url,
-            "requested_by": requested_by,
-            "added_at": time.time()
-        }
+# -----------------------------
+# Player loop (background)
+# -----------------------------
+async def player_loop():
+    """
+    Continuously runs:
+      - If request_queue has items: play them FIFO.
+      - Else: pick random from BOLLYWOOD_RANDOM_TRACKS and play.
+    For each 'play' it fetches stream URL (via youtube_service.get_audio_stream_url)
+    then performs an aiohttp GET and reads chunks, broadcasting into client queues.
+    Supports interruption by setting _skip_current event.
+    """
+    global current_track, current_audio_url, player_status, _skip_current
 
-        play_queue.append(queue_item)
-        position = len(play_queue)
-        
-        return {
-            "success": True, 
-            "position": position,
-            "track": queue_item
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-async def play_track_immediately(video_url: str, requested_by: str = "Unknown"):
-    """Play a track immediately (stop current and play this)"""
-    global current_track, current_audio_url, is_random_playing, current_track_start_time
-    
-    try:
-        video_id = youtube_service.extract_video_id(video_url)
-        if not video_id:
-            return {"success": False, "error": "Invalid YouTube URL"}
-
-        video_info = await youtube_service.get_video_info(video_id)
-        if not video_info:
-            return {"success": False, "error": "Video not found"}
-
-        audio_url = await youtube_service.get_audio_stream_url(video_url)
-        if not audio_url:
-            return {"success": False, "error": "No audio stream found"}
-
-        current_track = {
-            **video_info,
-            "url": video_url,
-            "audio_url": audio_url,
-            "requested_by": requested_by,
-            "source": 'youtube_api'
-        }
-        current_audio_url = audio_url
-        is_random_playing = False
-        current_track_start_time = time.time()
-        
-        print(f"🎵 Now playing immediately: {current_track['title']}")
-        return {"success": True, "track": current_track}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-async def play_next_in_queue():
-    """Play next song in queue"""
-    global current_track, current_audio_url, is_random_playing, current_track_start_time
-    
-    if play_queue:
-        next_track = play_queue.popleft()
+    print("🔁 Player loop starting...")
+    while _player_loop_should_run:
         try:
-            audio_url = await youtube_service.get_audio_stream_url(next_track['url'])
-            if audio_url:
-                current_track = {**next_track, "audio_url": audio_url}
-                current_audio_url = audio_url
-                is_random_playing = False
-                current_track_start_time = time.time()
-                print(f"🎵 Now playing from queue: {current_track['title']}")
-                return True
-        except Exception as e:
-            print(f"Queue play error: {e}")
-    
-    # Start random if no queue
-    await start_random_playback()
-    return False
-
-async def start_random_playback():
-    """Start random Bollywood songs"""
-    global current_track, current_audio_url, is_random_playing, random_playlist, current_track_start_time
-    
-    if not random_playlist:
-        random_playlist = BOLYWOOD_CLUB_SONGS.copy()
-        random.shuffle(random_playlist)
-    
-    if not random_playlist:
-        return
-    
-    search_query = random_playlist.pop(0)
-    if not random_playlist:
-        random_playlist = BOLYWOOD_CLUB_SONGS.copy()
-        random.shuffle(random_playlist)
-    
-    try:
-        print(f"🎲 Searching random: {search_query}")
-        results = await youtube_service.search_music(search_query, limit=1)
-        if results:
-            random_track = results[0]
-            audio_url = await youtube_service.get_audio_stream_url(random_track['url'])
-            
-            if audio_url:
-                current_track = {
-                    **random_track,
-                    "audio_url": audio_url,
-                    "requested_by": "Auto DJ",
-                    "is_random": True
+            next_item = None
+            if request_queue:
+                # Pop next requested song (FIFO)
+                next_item = request_queue.pop(0)
+                print(f"▶️ Playing requested track: {next_item.get('title')}")
+            else:
+                # Choose random track from pool
+                import random
+                random_url = random.choice(BOLLYWOOD_RANDOM_TRACKS)
+                next_item = {
+                    'id': None,
+                    'title': f"Random Track ({random_url.split('v=')[-1]})",
+                    'url': random_url,
+                    'artist': 'Bollywood Mix',
+                    'source': 'random'
                 }
-                current_audio_url = audio_url
-                is_random_playing = True
-                current_track_start_time = time.time()
-                print(f"🎲 Now playing random: {current_track['title']}")
-    except Exception as e:
-        print(f"Random playback error: {e}")
+                print(f"▶️ No queued requests — playing random: {next_item['url']}")
 
-async def skip_current_track():
-    """Skip current track"""
-    global current_track, current_audio_url
-    
-    if play_queue:
-        await play_next_in_queue()
-        return {"success": True, "message": "Skipped to next in queue"}
-    elif is_random_playing:
-        await start_random_playback()
-        return {"success": True, "message": "Skipped to next random song"}
-    else:
-        await start_random_playback()
-        return {"success": True, "message": "Skipped to random song"}
+            # Resolve audio stream url
+            play_url = await youtube_service.get_audio_stream_url(next_item['url'])
+            if not play_url:
+                print("❌ Could not resolve audio stream URL, skipping to next")
+                continue
 
-def update_activity():
-    """Update last activity time"""
-    global last_activity_time
-    last_activity_time = time.time()
+            # Set current metadata
+            current_audio_url = play_url
+            current_track = {
+                'id': next_item.get('id'),
+                'title': next_item.get('title'),
+                'artist': next_item.get('artist', 'Unknown'),
+                'duration': next_item.get('duration', 0),
+                'thumbnail': next_item.get('thumbnail'),
+                'url': play_url,
+                'source': next_item.get('source', 'youtube')
+            }
+            player_status = "playing"
+            _skip_current.clear()
 
-async def auto_resume_check():
-    """Check if stream needs to be resumed (if someone paused it)"""
-    global current_audio_url, player_status
-    
-    while True:
-        try:
-            # If we have a current track but no audio URL (stream was interrupted)
-            if current_track and not current_audio_url:
-                print("🔄 Stream interrupted, attempting to resume...")
-                if current_track.get('url'):
-                    audio_url = await youtube_service.get_audio_stream_url(current_track['url'])
-                    if audio_url:
-                        current_audio_url = audio_url
-                        print("✅ Stream resumed successfully")
-            
-            # If no current track at all, start random playback
-            elif not current_track:
-                await start_random_playback()
-                
+            # Upstream fetch & broadcast loop using aiohttp streaming
+            # We'll open the upstream connection and stream its content out to all listeners.
+            try:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                        # don't request range — treat as live stream
+                    }
+                    async with session.get(current_audio_url, headers=headers) as upstream_resp:
+                        print(f"🔗 Upstream response status: {upstream_resp.status} content-type: {upstream_resp.headers.get('content-type')}")
+                        if upstream_resp.status != 200 and upstream_resp.status != 206:
+                            print("❌ Upstream returned non-OK status — skipping track")
+                        else:
+                            # Read chunks until upstream ends or _skip_current is set
+                            async for chunk in upstream_resp.content.iter_chunked(8192):
+                                if _skip_current.is_set():
+                                    # Immediately stop reading further chunks for this track
+                                    print("⏭️ Skip signal set — stopping current track fetch")
+                                    break
+                                if not chunk:
+                                    await asyncio.sleep(0.01)
+                                    continue
+                                # broadcast chunk to clients (non-blocking)
+                                await broadcast_chunk(chunk)
+                            # finished with this track
+            except Exception as e:
+                print(f"❌ Upstream fetch error: {e}")
+
+            # After track ended or skipped, short gap then continue loop
+            # Clear current_audio_url/metadata only if no queued tracks and next action is stop
+            # For continuous play we simply loop to next track
+            current_audio_url = None
+            current_track = None
+            player_status = "stopped" if not request_queue and not BOLLYWOOD_RANDOM_TRACKS else "stopped"
+            # small sleep to avoid busy-loop
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            print("🔴 Player task cancelled")
+            break
         except Exception as e:
-            print(f"Auto-resume check error: {e}")
-        
-        await asyncio.sleep(1)  # Check every 10 seconds
+            print(f"❌ Player loop error: {e}")
+            await asyncio.sleep(1)
 
-# Start random playback on startup
+# Start the player loop as background task on startup
 @app.on_event("startup")
 async def startup_event():
-    global last_activity_time
-    last_activity_time = time.time()
-    await start_random_playback()
-    asyncio.create_task(auto_resume_check())
+    global _player_task, _player_loop_should_run
+    _player_loop_should_run = True
+    _player_task = asyncio.create_task(player_loop())
+    print("✅ Player background task started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _player_task, _player_loop_should_run
+    _player_loop_should_run = False
+    if _player_task:
+        _player_task.cancel()
+    print("⛔ Shutting down player loop")
 
 # -----------------------------
-# 🎧 FastAPI Endpoints
+# API endpoints (kept shape compatible)
 # -----------------------------
 
 @app.get("/")
@@ -433,183 +392,182 @@ async def root():
             "play": "POST /api/play",
             "stream": "/api/stream",
             "status": "/api/status",
-            "skip": "POST /api/skip"
+            "stop": "POST /api/stop"
         }
     }
 
 @app.get("/api/search")
 async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=20)):
+    if not q:
+        raise HTTPException(status_code=400, detail="Query parameter required")
     if not YOUTUBE_API_KEY:
         raise HTTPException(status_code=500, detail="YouTube API key not configured")
+    print(f"🎵 API Search: {q}")
     results = await youtube_service.search_music(q, limit)
-    return {"query": q, "results": results, "count": len(results)}
-
-@app.post("/api/play")
-async def play_music(video_url: str = Form(...), requested_by: str = Form("Unknown")):
-    global current_track, current_audio_url, is_random_playing, play_queue
-    
-    try:
-        print(f"🎵 Play request from {requested_by}: {video_url}")
-        update_activity()
-        
-        # If nothing is playing OR only random is playing, play immediately
-        if not current_track or is_random_playing:
-            result = await play_track_immediately(video_url, requested_by)
-            if result["success"]:
-                return {
-                    "status": "playing",
-                    "track": result["track"],
-                    "stream_url": "https://virus-music-backend-production.up.railway.app/api/stream",
-                    "message": f"🎵 Now playing: {result['track']['title']} by {result['track']['artist']}"
-                }
-            else:
-                raise HTTPException(status_code=400, detail=result["error"])
-        
-        # If a user-requested song is already playing, add to queue
-        else:
-            result = await add_to_queue(video_url, requested_by)
-            if result["success"]:
-                return {
-                    "status": "queued",
-                    "position": result["position"],
-                    "track": result["track"],
-                    "message": f"🎵 Added to queue (position {result['position']}): {result['track']['title']}"
-                }
-            else:
-                raise HTTPException(status_code=400, detail=result["error"])
-
-    except Exception as e:
-        print(f"❌ Play error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# New endpoints for queue management
-@app.post("/api/queue")
-async def add_to_queue_endpoint(video_url: str = Form(...), requested_by: str = Form("Unknown")):
-    result = await add_to_queue(video_url, requested_by)
-    if result["success"]:
-        return {
-            "status": "queued",
-            "position": result["position"],
-            "track": result["track"],
-            "queue_length": len(play_queue)
-        }
-    else:
-        raise HTTPException(status_code=400, detail=result["error"])
-
-@app.post("/api/skip")
-async def skip_track():
-    result = await skip_current_track()
-    return result
-
-@app.get("/api/queue")
-async def get_queue_status():
     return {
-        "current_track": current_track,
-        "queue": list(play_queue),
-        "queue_length": len(play_queue),
-        "is_random_playing": is_random_playing
+        "query": q,
+        "results": results,
+        "count": len(results),
+        "message": f"Found {len(results)} tracks via YouTube API"
     }
 
-@app.get("/api/stream")
-async def stream_audio():
-    global current_audio_url
-
-    update_activity()  # Update activity on stream access
-
-    if not current_audio_url:
-        # If no audio URL, try to get one
-        if current_track and current_track.get('url'):
-            # Try to resume current track
-            audio_url = await youtube_service.get_audio_stream_url(current_track['url'])
-            if audio_url:
-                current_audio_url = audio_url
-                print("✅ Resumed current track stream")
-        else:
-            # If no current track, start fresh
-            if not await play_next_in_queue():
-                await start_random_playback()
-        
-        if not current_audio_url:
-            # Return silent audio if still no stream
-            silent_audio = b'\x00' * 1024
-            return StreamingResponse(iter([silent_audio]), media_type="audio/mpeg")
+@app.post("/api/play")
+async def play_music(video_url: str = Form(...), request: Request = None):
+    """
+    If a track is playing:
+      - Add requested track to request_queue and return queue position.
+    If nothing is playing:
+      - Add track to queue and signal player loop to start it immediately.
+    Returns 'radio_url' for compatibility with your bot.
+    """
+    global request_queue, _skip_current, player_status
 
     try:
-        def generate():
-            try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0',
-                    'Accept': '*/*',
-                }
-                # Stream the audio continuously
-                response = requests.get(current_audio_url, stream=True, timeout=30, headers=headers)
-                response.raise_for_status()
-                
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-                
-                # Song ended, play next
-                print("🎵 Song ended, playing next...")
-                asyncio.create_task(play_next_in_queue())
-                
-            except Exception as e:
-                print(f"Stream error: {e}")
-                # Try to play next song on error
-                asyncio.create_task(play_next_in_queue())
-                # Return silent audio temporarily
-                yield b'\x00' * 8192
+        print(f"🎵 Play request received: {video_url}")
+        # Extract id and info if possible
+        video_id = youtube_service.extract_video_id(video_url)
+        video_info = None
+        if video_id and YOUTUBE_API_KEY:
+            video_info = await youtube_service.get_video_info(video_id)
 
-        return StreamingResponse(
-            generate(), 
-            media_type="audio/mpeg", 
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
-        )
+        track_meta = {
+            'id': video_id,
+            'title': (video_info['title'] if video_info else video_url),
+            'url': video_url,
+            'artist': (video_info['artist'] if video_info else 'Unknown'),
+            'duration': (video_info['duration'] if video_info else 0),
+            'thumbnail': (video_info.get('thumbnail') if video_info else None),
+            'requested_at': time.time(),
+        }
 
+        # If already playing, queue the request and return position
+        if player_status == "playing" and current_track is not None:
+            request_queue.append(track_meta)
+            position = len(request_queue)
+            print(f"➕ Track queued at position {position}")
+            return JSONResponse({
+                "status": "queued",
+                "position": position,
+                "track": track_meta,
+                "radio_url": f"{request.url.scheme}://{request.client.host}{request.url.path}".replace("/api/play", "/api/stream") if request else "/api/stream",
+                "message": f"Track queued at position {position}"
+            })
+
+        # If not playing -> append and signal player loop (it will pick it up)
+        request_queue.append(track_meta)
+        # If random is currently playing, instruct skip to interrupt random and start requested immediately
+        _skip_current.set()
+        print("▶️ Requested track appended; signaled player loop to start it immediately")
+
+        # Return radio_url for bot compatibility
+        # Try to return full URL if request context available, else fallback static stream url
+        radio_url = f"{request.url.scheme}://{request.client.host}{request.url.path}".replace("/api/play", "/api/stream") if request else "https://virus-music-backend-production.up.railway.app/api/stream"
+        return {
+            "status": "playing",
+            "track": track_meta,
+            "radio_url": radio_url,
+            "message": f"🎵 Your track will play next"
+        }
+
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"Stream proxy error: {e}")
-        # Return silent audio and try to recover
-        asyncio.create_task(play_next_in_queue())
-        return StreamingResponse(iter([b'\x00' * 1024]), media_type="audio/mpeg")
+        print(f"❌ Play error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to play: {str(e)}")
 
-# Remove stop endpoint since music never stops
+@app.get("/api/stream")
+async def stream_audio(request: Request):
+    """
+    Clients connect here and receive the live stream. Each client receives the
+    broadcasted chunk stream (they do not re-request the upstream from the beginning).
+    """
+    global player_status
+
+    # Register a per-client queue
+    q = await register_client_queue()
+    print(f"🔌 Client connected, total clients: {len(_client_queues)}")
+
+    async def client_generator():
+        try:
+            # While connected, yield chunks as they arrive
+            while True:
+                # If client disconnects, Request.is_disconnected is True (fastapi starlette)
+                if await request.is_disconnected():
+                    break
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=30.0)
+                    yield chunk
+                except asyncio.TimeoutError:
+                    # If nothing for a while, send a tiny silent keepalive so clients won't hang
+                    yield b''  # zero-length chunk as keepalive
+                    continue
+        finally:
+            await unregister_client_queue(q)
+            print(f"🔌 Client disconnected, remaining clients: {len(_client_queues)}")
+
+    # Keep the media_type audio/mpeg as before
+    return StreamingResponse(client_generator(), media_type="audio/mpeg", headers={
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache"
+    })
+
 @app.post("/api/stop")
 async def stop_music():
-    """Stop is disabled - music always plays"""
-    return {"status": "error", "message": "Music cannot be stopped - this is a live radio stream"}
+    """
+    Called by bot for stop/skip. Behavior:
+      - If there are more songs in request_queue -> skip current and play next
+      - Else -> stop playback (player loop will continue playing random tracks unless stopped)
+    """
+    global request_queue, _skip_current, player_status, current_track
+
+    try:
+        if request_queue:
+            # skip current and start next requested immediately
+            _skip_current.set()
+            # player_loop will pop next item automatically
+            print("⏭️ Skip requested — there is a queued track, skipping to next")
+            return {"status": "playing", "message": "Skipped to next track"}
+        else:
+            # no queued songs — stop playback (pause broadcasting upstream, keep stream endpoint alive)
+            # We signal skip_current to stop upstream fetch and leave player to pick next (it will choose random)
+            _skip_current.set()
+            # clear current_track and mark stopped so /api/status shows stopped until random starts
+            current_track = None
+            player_status = "stopped"
+            print("⏹️ Stop requested — no queued tracks, stopping current playback")
+            return {"status": "stopped", "message": "Playback stopped"}
+    except Exception as e:
+        print(f"❌ Stop error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/status")
 async def get_player_status():
-    current_time = time.time()
-    track_progress = current_time - current_track_start_time if current_track_start_time > 0 else 0
-    
     return {
-        "status": "playing",  # Always playing
+        "status": player_status,
         "current_track": current_track,
-        "track_progress": track_progress,
-        "is_random_playing": is_random_playing,
-        "queue_length": len(play_queue),
-        "stream_active": True  # Always active
+        "stream_active": player_status == "playing",
+        "queued": len(request_queue)
     }
 
 @app.get("/api/radio/url")
 async def get_radio_url():
+    stream_url = "https://virus-music-backend-production.up.railway.app/api/stream"
     return {
-        "radio_url": "https://virus-music-backend-production.up.railway.app/api/stream",
-        "status": "playing",
-        "current_track": current_track['title'] if current_track else 'Auto DJ - Bollywood Mix',
-        "artist": current_track['artist'] if current_track else 'Various Artists',
-        "is_live": True
+        "radio_url": stream_url,
+        "status": player_status,
+        "current_track": current_track['title'] if current_track else 'No track playing',
+        "artist": current_track['artist'] if current_track else 'None',
+        "instructions": "Add this URL to Highrise room music settings!"
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "4.2.0", "stream_active": True}
+    return {
+        "status": "healthy",
+        "player_status": player_status,
+        "service": "YouTube Data API Streaming",
+        "version": "4.2.0"
+    }
 
 if __name__ == "__main__":
     import uvicorn
