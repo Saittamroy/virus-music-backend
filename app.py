@@ -27,8 +27,8 @@ current_audio_url = None
 play_queue = deque()
 is_random_playing = False
 random_playlist = []
-stream_start_time = 0
 current_track_start_time = 0
+last_activity_time = 0
 
 # YouTube Data API configuration
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
@@ -274,6 +274,40 @@ async def add_to_queue(video_url: str, requested_by: str = "Unknown"):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+async def play_track_immediately(video_url: str, requested_by: str = "Unknown"):
+    """Play a track immediately (stop current and play this)"""
+    global current_track, current_audio_url, is_random_playing, current_track_start_time
+    
+    try:
+        video_id = youtube_service.extract_video_id(video_url)
+        if not video_id:
+            return {"success": False, "error": "Invalid YouTube URL"}
+
+        video_info = await youtube_service.get_video_info(video_id)
+        if not video_info:
+            return {"success": False, "error": "Video not found"}
+
+        audio_url = await youtube_service.get_audio_stream_url(video_url)
+        if not audio_url:
+            return {"success": False, "error": "No audio stream found"}
+
+        current_track = {
+            **video_info,
+            "url": video_url,
+            "audio_url": audio_url,
+            "requested_by": requested_by,
+            "source": 'youtube_api'
+        }
+        current_audio_url = audio_url
+        is_random_playing = False
+        current_track_start_time = time.time()
+        
+        print(f"🎵 Now playing immediately: {current_track['title']}")
+        return {"success": True, "track": current_track}
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 async def play_next_in_queue():
     """Play next song in queue"""
     global current_track, current_audio_url, is_random_playing, current_track_start_time
@@ -347,12 +381,42 @@ async def skip_current_track():
         await start_random_playback()
         return {"success": True, "message": "Skipped to random song"}
 
+def update_activity():
+    """Update last activity time"""
+    global last_activity_time
+    last_activity_time = time.time()
+
+async def auto_resume_check():
+    """Check if stream needs to be resumed (if someone paused it)"""
+    global current_audio_url, player_status
+    
+    while True:
+        try:
+            # If we have a current track but no audio URL (stream was interrupted)
+            if current_track and not current_audio_url:
+                print("🔄 Stream interrupted, attempting to resume...")
+                if current_track.get('url'):
+                    audio_url = await youtube_service.get_audio_stream_url(current_track['url'])
+                    if audio_url:
+                        current_audio_url = audio_url
+                        print("✅ Stream resumed successfully")
+            
+            # If no current track at all, start random playback
+            elif not current_track:
+                await start_random_playback()
+                
+        except Exception as e:
+            print(f"Auto-resume check error: {e}")
+        
+        await asyncio.sleep(1)  # Check every 10 seconds
+
 # Start random playback on startup
 @app.on_event("startup")
 async def startup_event():
-    global stream_start_time
-    stream_start_time = time.time()
+    global last_activity_time
+    last_activity_time = time.time()
     await start_random_playback()
+    asyncio.create_task(auto_resume_check())
 
 # -----------------------------
 # 🎧 FastAPI Endpoints
@@ -382,18 +446,27 @@ async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10,
 
 @app.post("/api/play")
 async def play_music(video_url: str = Form(...), requested_by: str = Form("Unknown")):
-    global current_track, current_audio_url, is_random_playing
+    global current_track, current_audio_url, is_random_playing, play_queue
     
     try:
         print(f"🎵 Play request from {requested_by}: {video_url}")
+        update_activity()
         
-        # If random is playing, stop it and play requested song immediately
-        if is_random_playing:
-            play_queue.clear()
-            is_random_playing = False
+        # If nothing is playing OR only random is playing, play immediately
+        if not current_track or is_random_playing:
+            result = await play_track_immediately(video_url, requested_by)
+            if result["success"]:
+                return {
+                    "status": "playing",
+                    "track": result["track"],
+                    "stream_url": "https://virus-music-backend-production.up.railway.app/api/stream",
+                    "message": f"🎵 Now playing: {result['track']['title']} by {result['track']['artist']}"
+                }
+            else:
+                raise HTTPException(status_code=400, detail=result["error"])
         
-        # If something is playing, add to queue
-        if current_track:
+        # If a user-requested song is already playing, add to queue
+        else:
             result = await add_to_queue(video_url, requested_by)
             if result["success"]:
                 return {
@@ -404,36 +477,6 @@ async def play_music(video_url: str = Form(...), requested_by: str = Form("Unkno
                 }
             else:
                 raise HTTPException(status_code=400, detail=result["error"])
-        
-        # Play immediately (if nothing is playing)
-        video_id = youtube_service.extract_video_id(video_url)
-        if not video_id:
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
-
-        video_info = await youtube_service.get_video_info(video_id)
-        if not video_info:
-            raise HTTPException(status_code=404, detail="Video not found")
-
-        audio_url = await youtube_service.get_audio_stream_url(video_url)
-        if not audio_url:
-            raise HTTPException(status_code=404, detail="No audio stream found")
-
-        current_track = {
-            **video_info,
-            "url": video_url,
-            "audio_url": audio_url,
-            "requested_by": requested_by,
-            "source": 'youtube_api'
-        }
-        current_audio_url = audio_url
-        is_random_playing = False
-
-        return {
-            "status": "playing",
-            "track": current_track,
-            "stream_url": "https://virus-music-backend-production.up.railway.app/api/stream",
-            "message": f"🎵 Now playing: {current_track['title']} by {current_track['artist']}"
-        }
 
     except Exception as e:
         print(f"❌ Play error: {e}")
@@ -471,10 +514,20 @@ async def get_queue_status():
 async def stream_audio():
     global current_audio_url
 
+    update_activity()  # Update activity on stream access
+
     if not current_audio_url:
         # If no audio URL, try to get one
-        if not await play_next_in_queue():
-            await start_random_playback()
+        if current_track and current_track.get('url'):
+            # Try to resume current track
+            audio_url = await youtube_service.get_audio_stream_url(current_track['url'])
+            if audio_url:
+                current_audio_url = audio_url
+                print("✅ Resumed current track stream")
+        else:
+            # If no current track, start fresh
+            if not await play_next_in_queue():
+                await start_random_playback()
         
         if not current_audio_url:
             # Return silent audio if still no stream
