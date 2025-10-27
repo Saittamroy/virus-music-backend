@@ -53,7 +53,7 @@ class MusicStreamer:
                                 'url': f"https://www.youtube.com/watch?v={video['videoId']}",
                                 'duration': video.get('lengthSeconds', 0),
                                 'thumbnail': video.get('videoThumbnails', [{}])[0].get('url', ''),
-                                'uploader': video.get('author', 'Unknown Artist'),
+                                'artist': video.get('author', 'Unknown Artist'),
                                 'source': 'invidious'
                             })
                         
@@ -114,33 +114,74 @@ class MusicStreamer:
         ]
         
         # Filter by query if provided
-        if query:
+        if query and query.strip():
             filtered = [track for track in curated_music 
-                       if query.lower() in track['title'].lower() or query.lower() in track['artist'].lower()]
-            return filtered if filtered else curated_music[:2]
+                       if query.lower() in track['title'].lower() or 
+                          query.lower() in track['artist'].lower()]
+            return filtered if filtered else curated_music
         
-        return curated_music[:3]
+        return curated_music
     
-    async def get_audio_stream(self, track_data: Dict) -> str:
-        """Get audio stream URL - uses direct MP3 URLs"""
+    async def get_track_by_url(self, video_url: str) -> Dict:
+        """Get track information by URL - FIXED VERSION"""
         try:
-            # For Bensound and SoundJay, use the URL directly
-            if track_data.get('source') in ['bensound', 'soundjay']:
-                return track_data['url']
+            print(f"🎵 Looking up track by URL: {video_url}")
             
-            # For YouTube videos, try to get stream (but we'll mainly use curated music)
-            video_url = track_data.get('url', '')
+            # For curated music URLs, return the track directly
+            curated_tracks = self._get_curated_music("")
+            for track in curated_tracks:
+                if track['url'] == video_url:
+                    print(f"✅ Found curated track: {track['title']}")
+                    return track
+            
+            # For YouTube URLs, extract video ID and search
             if 'youtube.com' in video_url or 'youtu.be' in video_url:
-                # Fallback to curated music instead of trying YouTube
-                curated = self._get_curated_music('')
-                return curated[0]['url']
+                video_id = None
+                if 'youtube.com/watch?v=' in video_url:
+                    video_id = video_url.split('youtube.com/watch?v=')[1].split('&')[0]
+                elif 'youtu.be/' in video_url:
+                    video_id = video_url.split('youtu.be/')[1].split('?')[0]
+                
+                if video_id:
+                    # Search for this specific video
+                    invidious_instances = [
+                        "https://inv.tux.pizza",
+                        "https://invidious.snopyta.org", 
+                        "https://yewtu.be"
+                    ]
+                    
+                    for instance in invidious_instances:
+                        try:
+                            video_url = f"{instance}/api/v1/videos/{video_id}"
+                            response = requests.get(video_url, timeout=10)
+                            
+                            if response.status_code == 200:
+                                video_data = response.json()
+                                track_info = {
+                                    'id': video_data['videoId'],
+                                    'title': video_data['title'],
+                                    'url': f"https://www.youtube.com/watch?v={video_data['videoId']}",
+                                    'duration': video_data.get('lengthSeconds', 0),
+                                    'thumbnail': video_data.get('videoThumbnails', [{}])[3].get('url', ''),
+                                    'artist': video_data.get('author', 'Unknown Artist'),
+                                    'source': 'invidious'
+                                }
+                                print(f"✅ Found YouTube track: {track_info['title']}")
+                                return track_info
+                                
+                        except Exception as e:
+                            print(f"❌ Invidious instance {instance} failed: {e}")
+                            continue
             
-            # Final fallback
-            return "https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3"
+            # Final fallback - return first curated track
+            fallback_track = curated_tracks[0]
+            print(f"⚠️ Using fallback track: {fallback_track['title']}")
+            return fallback_track
             
         except Exception as e:
-            print(f"❌ Audio stream error: {e}")
-            return "https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3"
+            print(f"❌ Track lookup error: {e}")
+            curated_tracks = self._get_curated_music("")
+            return curated_tracks[0]
 
 music_streamer = MusicStreamer()
 
@@ -149,7 +190,7 @@ async def root():
     return {
         "message": "Virus Music Radio API", 
         "status": "online",
-        "version": "6.0.0 - Invidious + Curated Music"
+        "version": "6.1.0 - Fixed Track Selection"
     }
 
 @app.get("/api/search")
@@ -170,42 +211,29 @@ async def search_music(q: str):
 
 @app.post("/api/play")
 async def play_music(video_url: str = Form(...)):
-    """Play music - FIXED FORM PARAMETER"""
+    """Play music - FIXED VERSION that properly selects requested track"""
     global current_track, player_status, current_audio_url
     
     try:
         print(f"🎵 Play request received: {video_url}")
         
-        # First, search to get full track info
-        search_results = await music_streamer.search_music("")
-        track_info = None
+        # Get the actual track info for the requested URL
+        track_info = await music_streamer.get_track_by_url(video_url)
         
-        # Find the track in search results
-        for track in search_results:
-            if track['url'] == video_url:
-                track_info = track
-                break
-        
-        if not track_info:
-            # Use first curated track as fallback
-            track_info = music_streamer._get_curated_music("")[0]
-        
-        # Get audio stream URL
-        audio_url = await music_streamer.get_audio_stream(track_info)
-        print(f"🎵 Audio URL: {audio_url}")
+        print(f"🎵 Selected track: {track_info['title']}")
         
         # Set current track
         current_track = {
             'id': track_info['id'],
             'title': track_info['title'],
-            'artist': track_info.get('artist', track_info.get('uploader', 'Unknown Artist')),
+            'artist': track_info.get('artist', 'Unknown Artist'),
             'duration': track_info['duration'],
             'thumbnail': track_info.get('thumbnail', ''),
-            'url': audio_url,
+            'url': track_info['url'],  # Use the actual URL
             'source': track_info.get('source', 'direct')
         }
         
-        current_audio_url = audio_url
+        current_audio_url = track_info['url']  # Use the actual audio URL
         player_status = "playing"
         
         # Get stream URL for Highrise
@@ -216,7 +244,7 @@ async def play_music(video_url: str = Form(...)):
             "status": "playing", 
             "track": current_track,
             "stream_url": stream_url,
-            "message": f"🎵 Now playing: {current_track['title']}"
+            "message": f"🎵 Now playing: {current_track['title']} by {current_track['artist']}"
         }
         
     except Exception as e:
@@ -229,10 +257,13 @@ async def stream_audio():
     global current_audio_url, player_status
     
     if player_status == "playing" and current_audio_url:
+        print(f"🎵 Streaming: {current_audio_url}")
         return RedirectResponse(url=current_audio_url)
     else:
         # Always return a working audio stream
-        return RedirectResponse(url="https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3")
+        default_url = "https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3"
+        print(f"🎵 Streaming default: {default_url}")
+        return RedirectResponse(url=default_url)
 
 @app.post("/api/stop")
 async def stop_music():
