@@ -1,12 +1,13 @@
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-import aiohttp
+import subprocess
 import os
+import asyncio
 from typing import Dict, List
-import json
+import yt_dlp
+import aiohttp
 
-app = FastAPI(title="Virus Music Radio API")
+app = FastAPI(title="AzuraCast Radio API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,157 +16,257 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Radio configuration
+ICECAST_CONFIG = {
+    'host': '0.0.0.0',
+    'port': '8001',
+    'password': 'hackme',
+    'mount': '/radio'
+}
+
 # Global state
+current_stream_process = None
 current_track = None
 player_status = "stopped"
-current_audio_url = None
 
-class MusicStreamer:
+class AzuraCastStreamer:
     def __init__(self):
-        self.deezer_base = "https://api.deezer.com"
+        self.ydl_opts = {
+            'format': 'bestaudio/best',
+            'extractaudio': True,
+            'audioformat': 'mp3',
+            'noplaylist': True,
+            'quiet': True,
+        }
     
-    async def search_music(self, query: str) -> List[Dict]:
-        """Search music using Deezer API"""
+    def search_youtube(self, query: str) -> List[Dict]:
+        """Search YouTube for music"""
         try:
-            print(f"🔍 Searching Deezer for: {query}")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.deezer_base}/search?q={query}&limit=5") as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        results = []
-                        for track in data.get('data', [])[:5]:
-                            # Only include tracks with previews
-                            if track.get('preview'):
-                                results.append({
-                                    'id': str(track['id']),
-                                    'title': track['title'],
-                                    'artist': track['artist']['name'],
-                                    'duration': track['duration'],
-                                    'thumbnail': track['album']['cover_medium'],
-                                    'preview_url': track.get('preview', ''),
-                                    'source': 'deezer'
-                                })
-                        
-                        if results:
-                            return results
-                    
-                    # Fallback to free music
-                    return self._get_curated_music(query)
-                    
+            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+                search_query = f"ytsearch5:{query}"
+                info = ydl.extract_info(search_query, download=False)
+                
+                results = []
+                for entry in info['entries']:
+                    if entry:
+                        results.append({
+                            'id': entry['id'],
+                            'title': entry['title'],
+                            'url': entry['webpage_url'],
+                            'duration': entry.get('duration', 0),
+                            'thumbnail': entry.get('thumbnail'),
+                            'uploader': entry.get('uploader')
+                        })
+                return results[:3]
         except Exception as e:
-            print(f"Deezer search error: {e}")
-            return self._get_curated_music(query)
+            print(f"Search error: {e}")
+            return self._get_fallback_songs(query)
     
-    def _get_curated_music(self, query: str) -> List[Dict]:
-        """Curated list of free-to-use music that actually plays"""
-        free_music = [
+    def _get_fallback_songs(self, query: str) -> List[Dict]:
+        """Fallback songs"""
+        fallback_songs = [
             {
-                'id': '1',
-                'title': 'Summer Walk',
-                'artist': 'Background Music',
-                'duration': 180,
-                'thumbnail': '',
-                'preview_url': 'https://www.soundjay.com/music/summer-walk-01.mp3',
-                'source': 'soundjay'
+                'id': 'kJQP7kiw5Fk',
+                'title': 'Despacito',
+                'url': 'https://www.youtube.com/watch?v=kJQP7kiw5Fk',
+                'duration': 280,
+                'thumbnail': 'https://i.ytimg.com/vi/kJQP7kiw5Fk/hqdefault.jpg',
+                'uploader': 'Luis Fonsi'
             },
             {
-                'id': '2', 
-                'title': 'Acoustic Breeze',
-                'artist': 'Bensound',
-                'duration': 157,
-                'thumbnail': '',
-                'preview_url': 'https://www.bensound.com/bensound-music/bensound-acousticbreeze.mp3',
-                'source': 'bensound'
-            },
-            {
-                'id': '3',
-                'title': 'Better Days',
-                'artist': 'Bensound', 
-                'duration': 188,
-                'thumbnail': '',
-                'preview_url': 'https://www.bensound.com/bensound-music/bensound-betterdays.mp3',
-                'source': 'bensound'
-            },
-            {
-                'id': '4',
-                'title': 'Happy Rock',
-                'artist': 'Bensound',
-                'duration': 167,
-                'thumbnail': '',
-                'preview_url': 'https://www.bensound.com/bensound-music/bensound-happyrock.mp3',
-                'source': 'bensound'
+                'id': 'JGwWNGJdvx8',
+                'title': 'Shape of You', 
+                'url': 'https://www.youtube.com/watch?v=JGwWNGJdvx8',
+                'duration': 234,
+                'thumbnail': 'https://i.ytimg.com/vi/JGwWNGJdvx8/hqdefault.jpg',
+                'uploader': 'Ed Sheeran'
             }
         ]
-        
-        # Filter by query
-        if query:
-            filtered = [track for track in free_music 
-                       if query.lower() in track['title'].lower() or query.lower() in track['artist'].lower()]
-            return filtered if filtered else free_music[:2]
-        
-        return free_music[:3]
+        return fallback_songs
     
-    async def get_audio_stream(self, track_data: Dict) -> str:
-        """Get audio stream URL from track data"""
+    def start_radio_stream(self, video_url: str) -> bool:
+        """Start streaming to Icecast radio"""
+        global current_stream_process, player_status, current_track
+        
         try:
-            # Use the preview URL directly
-            preview_url = track_data.get('preview_url')
-            if preview_url:
-                print(f"🎵 Using preview URL: {preview_url}")
-                return preview_url
+            # Stop existing stream
+            if current_stream_process:
+                current_stream_process.terminate()
+                current_stream_process = None
             
-            # Final fallback - guaranteed working audio
-            return "https://www.soundjay.com/music/summer-walk-01.mp3"
+            # Get audio URL and track info
+            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                audio_url = info['url']
+                
+                current_track = {
+                    'id': info['id'],
+                    'title': info['title'],
+                    'artist': info.get('uploader', 'Unknown'),
+                    'duration': info.get('duration', 0),
+                    'thumbnail': info.get('thumbnail'),
+                    'url': video_url
+                }
+            
+            # Start Icecast server in background
+            self._start_icecast()
+            
+            # Stream to Icecast using FFmpeg
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-re',
+                '-i', audio_url,
+                '-acodec', 'libmp3lame',
+                '-ab', '128k',
+                '-ac', '2',
+                '-content_type', 'audio/mpeg',
+                '-f', 'mp3',
+                f'icecast://source:{ICECAST_CONFIG["password"]}@{ICECAST_CONFIG["host"]}:{ICECAST_CONFIG["port"]}{ICECAST_CONFIG["mount"]}'
+            ]
+            
+            print(f"🎧 Starting radio stream: {' '.join(ffmpeg_cmd)}")
+            current_stream_process = subprocess.Popen(ffmpeg_cmd)
+            player_status = "playing"
+            return True
             
         except Exception as e:
-            print(f"Audio stream error: {e}")
-            return "https://www.soundjay.com/music/summer-walk-01.mp3"
+            print(f"Radio stream error: {e}")
+            player_status = "error"
+            return False
+    
+    def _start_icecast(self):
+        """Start Icecast server in background"""
+        try:
+            # Create basic icecast config
+            icecast_config = f"""
+<icecast>
+    <location>Radio Server</location>
+    <admin>admin@localhost</admin>
+    
+    <limits>
+        <clients>100</clients>
+        <sources>5</sources>
+        <threadpool>5</threadpool>
+        <queue-size>524288</queue-size>
+        <client-timeout>30</client-timeout>
+        <header-timeout>15</header-timeout>
+        <source-timeout>10</source-timeout>
+    </limits>
+    
+    <authentication>
+        <source-password>{ICECAST_CONFIG['password']}</source-password>
+        <relay-password>{ICECAST_CONFIG['password']}</relay-password>
+        <admin-user>admin</admin-user>
+        <admin-password>{ICECAST_CONFIG['password']}</admin-password>
+    </authentication>
+    
+    <hostname>{ICECAST_CONFIG['host']}</hostname>
+    <listen-socket>
+        <port>{ICECAST_CONFIG['port']}</port>
+    </listen-socket>
+    
+    <fileserve>1</fileserve>
+    <paths>
+        <logdir>/var/log/icecast2</logdir>
+        <webroot>/usr/share/icecast2/web</webroot>
+        <adminroot>/usr/share/icecast2/web</adminroot>
+    </paths>
+    
+    <logging>
+        <accesslog>access.log</accesslog>
+        <errorlog>error.log</errorlog>
+        <loglevel>2</loglevel>
+    </logging>
+</icecast>
+"""
+            # Write config and start icecast
+            with open('/tmp/icecast.xml', 'w') as f:
+                f.write(icecast_config)
+            
+            # Start icecast in background
+            subprocess.Popen(['icecast2', '-c', '/tmp/icecast.xml', '-b'])
+            print("🎧 Icecast server started")
+            
+        except Exception as e:
+            print(f"Icecast start error: {e}")
+    
+    def stop_radio_stream(self):
+        """Stop radio stream"""
+        global current_stream_process, player_status, current_track
+        
+        if current_stream_process:
+            current_stream_process.terminate()
+            current_stream_process = None
+        
+        current_track = None
+        player_status = "stopped"
 
-music_streamer = MusicStreamer()
+streamer = AzuraCastStreamer()
+
+@app.get("/")
+async def root():
+    return {
+        "message": "AzuraCast Radio API",
+        "status": "online",
+        "radio_url": f"http://{os.getenv('RAILWAY_STATIC_URL', 'localhost:8000')}:8001{ICECAST_CONFIG['mount']}"
+    }
+
+@app.get("/api/search")
+async def search_music(q: str):
+    """Search for music"""
+    if not q:
+        raise HTTPException(status_code=400, detail="Query parameter required")
+    
+    results = streamer.search_youtube(q)
+    return {"query": q, "results": results}
 
 @app.post("/api/play")
-async def play_music(track_data: str = Form(...)):
-    """Play music from free APIs - FIXED FORM DATA"""
-    global current_track, player_status, current_audio_url
+async def play_music(video_url: str, background_tasks: BackgroundTasks):
+    """Start radio stream"""
+    success = streamer.start_radio_stream(video_url)
     
-    try:
-        print(f"🎵 Received play request with track data")
-        
-        # Parse track data
-        track = json.loads(track_data)
-        print(f"🎵 Playing: {track.get('title', 'Unknown')}")
-        
-        # Get audio stream
-        audio_url = await music_streamer.get_audio_stream(track)
-        print(f"🎵 Audio URL: {audio_url}")
-        
-        current_track = {
-            'id': track.get('id', ''),
-            'title': track.get('title', 'Unknown Track'),
-            'artist': track.get('artist', 'Unknown Artist'),
-            'duration': track.get('duration', 0),
-            'thumbnail': track.get('thumbnail', ''),
-            'url': audio_url,
-            'source': track.get('source', 'free')
-        }
-        
-        current_audio_url = audio_url
-        player_status = "playing"
-        
-        base_url = os.getenv('RAILWAY_STATIC_URL', 'http://localhost:8000')
-        stream_url = f"{base_url}/api/stream"
-        
+    if success:
+        radio_url = f"http://{os.getenv('RAILWAY_STATIC_URL', 'localhost:8000')}:8001{ICECAST_CONFIG['mount']}"
         return {
-            "status": "playing", 
+            "status": "playing",
             "track": current_track,
-            "stream_url": stream_url,
-            "message": f"🎵 Now playing: {current_track['title']} - {current_track['artist']}"
+            "radio_url": radio_url,
+            "message": "Radio stream started! Add the radio URL to Highrise."
         }
-        
-    except Exception as e:
-        print(f"Play error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to start stream")
+    else:
+        raise HTTPException(status_code=500, detail="Failed to start radio stream")
 
-# Keep all other endpoints the same as before...
+@app.post("/api/stop")
+async def stop_music():
+    """Stop radio stream"""
+    streamer.stop_radio_stream()
+    return {"status": "stopped", "message": "Radio stopped"}
+
+@app.get("/api/status")
+async def get_player_status():
+    """Get player status"""
+    return {
+        "status": player_status,
+        "current_track": current_track,
+        "stream_active": current_stream_process is not None
+    }
+
+@app.get("/api/radio/url")
+async def get_radio_url():
+    """Get radio stream URL for Highrise"""
+    radio_url = f"http://{os.getenv('RAILWAY_STATIC_URL', 'localhost:8000')}:8001{ICECAST_CONFIG['mount']}"
+    
+    return {
+        "radio_url": radio_url,
+        "status": player_status,
+        "current_track": current_track['title'] if current_track else None,
+        "instructions": "Add this URL to Highrise room music settings!"
+    }
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "radio_streaming": current_stream_process is not None,
+        "icecast_port": 8001
+    }
