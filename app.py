@@ -1,13 +1,15 @@
 from fastapi import FastAPI, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 import yt_dlp
 import asyncio
 import os
+import requests
 from typing import Dict, List, Optional
 import uuid
+import io
 
-app = FastAPI(title="Virus Music Radio API", version="2.0.0")
+app = FastAPI(title="Virus Music Radio API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,8 +22,9 @@ app.add_middleware(
 current_track = None
 player_status = "stopped"
 current_audio_url = None
+current_audio_data = None
 
-# yt-dlp configuration
+# yt-dlp configuration for better audio extraction
 YDL_OPTS = {
     'format': 'bestaudio/best',
     'extractaudio': True,
@@ -30,6 +33,8 @@ YDL_OPTS = {
     'noplaylist': True,
     'quiet': False,
     'no_warnings': False,
+    'forceurl': True,
+    'cookiefile': 'cookies.txt',  # Optional: helps with age-restricted content
 }
 
 class YouTubeStreamer:
@@ -74,25 +79,42 @@ class YouTubeStreamer:
         try:
             print(f"🎵 Getting audio URL for: {youtube_url}")
             
+            # Use different options for better stream compatibility
+            stream_opts = {
+                'format': 'bestaudio/best',
+                'extractaudio': True,
+                'audioformat': 'mp3',
+                'noplaylist': True,
+                'forceurl': True,
+                'cookiefile': 'cookies.txt',
+            }
+            
             def extract_info():
-                with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+                with yt_dlp.YoutubeDL(stream_opts) as ydl:
                     return ydl.extract_info(youtube_url, download=False)
             
             info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
             
-            # Get the best audio URL
+            # Try to get the direct URL
             if 'url' in info:
-                print(f"✅ Got direct audio URL")
+                print(f"✅ Got direct audio URL: {info['url'][:100]}...")
                 return info['url']
             
-            # Fallback: find best audio format
+            # Try different format selection
             if 'formats' in info:
-                audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
-                if audio_formats:
-                    best_audio = max(audio_formats, key=lambda x: x.get('quality', 0))
-                    print(f"✅ Got audio format URL")
+                # Prefer formats that are known to work with streaming
+                preferred_formats = [
+                    f for f in info['formats'] 
+                    if f.get('acodec') != 'none' and 
+                    any(x in f.get('format_note', '').lower() for x in ['medium', 'high', 'audio'])
+                ]
+                
+                if preferred_formats:
+                    best_audio = max(preferred_formats, key=lambda x: x.get('quality', 0))
+                    print(f"✅ Got preferred audio format URL")
                     return best_audio['url']
             
+            print("❌ No suitable audio URL found")
             return None
             
         except Exception as e:
@@ -121,6 +143,20 @@ class YouTubeStreamer:
             print(f"❌ Video info error: {e}")
             return None
 
+    async def test_stream_url(self, stream_url: str) -> bool:
+        """Test if the stream URL is actually playable"""
+        try:
+            print(f"🔍 Testing stream URL: {stream_url[:100]}...")
+            
+            def test_request():
+                response = requests.get(stream_url, stream=True, timeout=10)
+                return response.status_code == 200 and 'audio' in response.headers.get('content-type', '')
+            
+            return await asyncio.get_event_loop().run_in_executor(None, test_request)
+        except Exception as e:
+            print(f"❌ Stream test failed: {e}")
+            return False
+
 # Initialize streamer
 music_streamer = YouTubeStreamer()
 
@@ -129,7 +165,7 @@ async def root():
     return {
         "message": "Virus Music Radio API", 
         "status": "online",
-        "version": "2.0.0 - YouTube Streaming",
+        "version": "2.1.0 - Fixed Streaming",
         "endpoints": {
             "search": "/api/search?q=query",
             "play": "POST /api/play",
@@ -175,6 +211,11 @@ async def play_music(video_url: str = Form(...)):
         
         print(f"🎵 Audio URL obtained: {audio_url[:100]}...")
         
+        # Test if the stream is actually playable
+        is_playable = await music_streamer.test_stream_url(audio_url)
+        if not is_playable:
+            print("⚠️ Stream URL might not be playable by Highrise")
+        
         # Set current track
         current_track = {
             'id': video_info['id'],
@@ -183,21 +224,19 @@ async def play_music(video_url: str = Form(...)):
             'duration': video_info['duration'],
             'thumbnail': video_info['thumbnail'],
             'url': audio_url,
-            'source': 'youtube'
+            'source': 'youtube',
+            'playable': is_playable
         }
         
         current_audio_url = audio_url
         player_status = "playing"
         
-        # Get stream URL for Highrise
-        base_url = os.getenv('RAILWAY_STATIC_URL', 'http://localhost:8000')
-        stream_url = f"{base_url}/api/stream"
-        
         return {
             "status": "playing", 
             "track": current_track,
-            "stream_url": stream_url,
-            "message": f"🎵 Now playing: {current_track['title']} by {current_track['artist']}"
+            "stream_url": f"https://virus-music-backend-production.up.railway.app/api/stream",
+            "message": f"🎵 Now playing: {current_track['title']} by {current_track['artist']}",
+            "stream_test": "playable" if is_playable else "may not be compatible"
         }
         
     except Exception as e:
@@ -206,17 +245,40 @@ async def play_music(video_url: str = Form(...)):
 
 @app.get("/api/stream")
 async def stream_audio():
-    """Stream audio - redirects to YouTube audio stream"""
+    """Stream audio - PROXY the YouTube audio stream with proper headers"""
     global current_audio_url, player_status
     
     print(f"🎵 Stream request received - Status: {player_status}")
     
-    if player_status == "playing" and current_audio_url:
-        print(f"🎵 Redirecting to audio stream: {current_audio_url[:100]}...")
-        return RedirectResponse(url=current_audio_url)
-    else:
-        # Return error instead of default stream
+    if player_status != "playing" or not current_audio_url:
         raise HTTPException(status_code=404, detail="No active stream. Please play a song first.")
+    
+    try:
+        print(f"🎵 Proxying stream: {current_audio_url[:100]}...")
+        
+        def generate():
+            response = requests.get(current_audio_url, stream=True, timeout=30)
+            response.raise_for_status()
+            
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        
+        # Return as a proper audio stream with correct headers
+        return StreamingResponse(
+            generate(),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Type": "audio/mpeg",
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+        
+    except Exception as e:
+        print(f"❌ Stream proxy error: {e}")
+        raise HTTPException(status_code=500, detail="Streaming failed")
 
 @app.post("/api/stop")
 async def stop_music():
@@ -243,15 +305,15 @@ async def get_player_status():
 @app.get("/api/radio/url")
 async def get_radio_url():
     """Get the radio stream URL for Highrise"""
-    base_url = os.getenv('RAILWAY_STATIC_URL', 'http://localhost:8000')
-    stream_url = f"{base_url}/api/stream"
+    stream_url = "https://virus-music-backend-production.up.railway.app/api/stream"
     
     return {
         "radio_url": stream_url,
         "status": player_status,
         "current_track": current_track['title'] if current_track else 'No track playing',
         "artist": current_track['artist'] if current_track else 'None',
-        "instructions": "Add this URL to Highrise room music settings!"
+        "instructions": "Add this URL to Highrise room music settings!",
+        "note": "This URL streams the currently playing song"
     }
 
 @app.get("/health")
@@ -260,17 +322,26 @@ async def health_check():
         "status": "healthy",
         "player_status": player_status,
         "service": "YouTube Music Streaming",
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
-# Additional utility endpoints
-@app.get("/api/info")
-async def get_video_info(url: str = Query(...)):
-    """Get video information without playing"""
-    info = await music_streamer.get_video_info(url)
-    if not info:
-        raise HTTPException(status_code=404, detail="Video not found")
-    return info
+# Test endpoint to verify streaming works
+@app.get("/api/test-stream")
+async def test_stream():
+    """Test if streaming is working"""
+    test_url = "https://www.bensound.com/bensound-music/bensound-ukulele.mp3"
+    
+    def generate():
+        response = requests.get(test_url, stream=True)
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+    
+    return StreamingResponse(
+        generate(),
+        media_type="audio/mpeg",
+        headers={"Content-Type": "audio/mpeg"}
+    )
 
 if __name__ == "__main__":
     import uvicorn
