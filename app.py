@@ -29,7 +29,6 @@ is_random_playing = False
 random_playlist = []
 current_track_start_time = 0
 last_activity_time = 0
-is_currently_streaming = False  # Moved to global scope
 
 # YouTube Data API configuration
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
@@ -513,7 +512,7 @@ async def get_queue_status():
 
 @app.get("/api/stream")
 async def stream_audio():
-    global current_audio_url, is_currently_streaming
+    global current_audio_url
 
     update_activity()  # Update activity on stream access
 
@@ -536,47 +535,31 @@ async def stream_audio():
             return StreamingResponse(iter([silent_audio]), media_type="audio/mpeg")
 
     try:
-        # Use a class to maintain state for the generator
-        class StreamGenerator:
-            def __init__(self):
-                self.finished = False
+        # Simple generator function for streaming
+        def generate():
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0',
+                    'Accept': '*/*',
+                }
+                # Stream the audio continuously
+                response = requests.get(current_audio_url, stream=True, timeout=30, headers=headers)
+                response.raise_for_status()
                 
-            def __iter__(self):
-                return self
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
                 
-            def __next__(self):
-                if self.finished:
-                    raise StopIteration
-                    
-                try:
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0',
-                        'Accept': '*/*',
-                    }
-                    # Stream the audio continuously
-                    response = requests.get(current_audio_url, stream=True, timeout=30, headers=headers)
-                    response.raise_for_status()
-                    
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            yield chunk
-                    
-                    # Song ended
-                    print("🎵 Song ended, scheduling next song...")
-                    self.finished = True
-                    
-                    # Schedule next song in the background
-                    asyncio.create_task(play_next_in_queue())
-                    
-                except Exception as e:
-                    print(f"Stream error: {e}")
-                    # Schedule next song on error
-                    asyncio.create_task(play_next_in_queue())
-                    self.finished = True
-                    yield b'\x00' * 8192
+                # Song ended
+                print("🎵 Song ended, will play next song on next stream request...")
+                
+            except Exception as e:
+                print(f"Stream error: {e}")
+                # Return silent audio temporarily
+                yield b'\x00' * 8192
 
         return StreamingResponse(
-            StreamGenerator(), 
+            generate(), 
             media_type="audio/mpeg", 
             headers={
                 "Access-Control-Allow-Origin": "*",
