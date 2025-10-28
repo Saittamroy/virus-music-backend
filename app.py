@@ -170,15 +170,143 @@ youtube_service = YouTubeAPIService()
 
 # ==================== CONTINUOUS STREAMING ENGINE ====================
 
-async def get_audio_stream_with_ytdlp(youtube_url: str) -> Optional[str]:
-    """Get audio stream URL using yt-dlp"""
+async def get_audio_stream_invidious(youtube_url: str) -> Optional[str]:
+    """Get audio stream from Invidious instances"""
+    try:
+        video_id = youtube_service.extract_video_id(youtube_url)
+        if not video_id:
+            return None
+        
+        # Try multiple Invidious instances
+        invidious_instances = [
+            "https://invidious.privacydev.net",
+            "https://inv.tux.pizza",
+            "https://invidious.lunar.icu",
+            "https://yt.artemislena.eu",
+        ]
+        
+        for instance in invidious_instances:
+            try:
+                logger.info(f"🔍 Trying Invidious: {instance}")
+                
+                async with youtube_service.session.get(
+                    f"{instance}/api/v1/videos/{video_id}",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # Get audio formats
+                        audio_formats = [
+                            f for f in data.get('adaptiveFormats', []) 
+                            if 'audio' in f.get('type', '').lower()
+                        ]
+                        
+                        if audio_formats:
+                            # Get best quality audio
+                            best_audio = max(audio_formats, key=lambda x: x.get('bitrate', 0))
+                            audio_url = best_audio.get('url')
+                            
+                            if audio_url:
+                                logger.info(f"✅ Got stream from {instance}")
+                                return audio_url
+            except Exception as e:
+                logger.warning(f"❌ Invidious {instance} failed: {e}")
+                continue
+        
+        return None
+    except Exception as e:
+        logger.error(f"Invidious error: {e}")
+        return None
+
+async def get_audio_stream_piped(youtube_url: str) -> Optional[str]:
+    """Get audio stream from Piped API"""
+    try:
+        video_id = youtube_service.extract_video_id(youtube_url)
+        if not video_id:
+            return None
+        
+        piped_instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://api.piped.privacydev.net",
+        ]
+        
+        for instance in piped_instances:
+            try:
+                logger.info(f"🔍 Trying Piped: {instance}")
+                
+                async with youtube_service.session.get(
+                    f"{instance}/streams/{video_id}",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # Get audio URL
+                        audio_streams = data.get('audioStreams', [])
+                        if audio_streams:
+                            best_audio = max(audio_streams, key=lambda x: x.get('bitrate', 0))
+                            audio_url = best_audio.get('url')
+                            
+                            if audio_url:
+                                logger.info(f"✅ Got stream from Piped")
+                                return audio_url
+            except Exception as e:
+                logger.warning(f"❌ Piped {instance} failed: {e}")
+                continue
+        
+        return None
+    except Exception as e:
+        logger.error(f"Piped error: {e}")
+        return None
+
+async def get_audio_stream_multi_source(youtube_url: str) -> Optional[str]:
+    """Try multiple sources to get audio stream"""
+    
+    # Method 1: Try yt-dlp with anti-bot measures
+    logger.info("🎵 Method 1: yt-dlp with anti-bot config")
+    audio_url = await get_audio_stream_with_ytdlp(youtube_url)
+    if audio_url:
+        return audio_url
+    
+    # Method 2: Try Invidious
+    logger.info("🎵 Method 2: Invidious instances")
+    audio_url = await get_audio_stream_invidious(youtube_url)
+    if audio_url:
+        return audio_url
+    
+    # Method 3: Try Piped
+    logger.info("🎵 Method 3: Piped API")
+    audio_url = await get_audio_stream_piped(youtube_url)
+    if audio_url:
+        return audio_url
+    
+    logger.error(f"❌ All methods failed for: {youtube_url}")
+    return None
+    """Get audio stream URL using yt-dlp with anti-bot measures"""
     try:
         import yt_dlp
+        
+        # Anti-bot configuration
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
             'noplaylist': True,
             'no_warnings': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                    'skip': ['hls', 'dash']
+                }
+            },
+            # Use mobile user agent to avoid bot detection
+            'user_agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+            'http_headers': {
+                'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+                'Sec-Fetch-Mode': 'navigate',
+            }
         }
 
         def extract():
