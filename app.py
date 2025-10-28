@@ -271,6 +271,7 @@ async def get_audio_stream_with_ytdlp(youtube_url: str) -> Optional[str]:
             'quiet': True,
             'noplaylist': True,
             'no_warnings': True,
+            'extract_flat': False,
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android', 'web'],
@@ -278,29 +279,45 @@ async def get_audio_stream_with_ytdlp(youtube_url: str) -> Optional[str]:
                 }
             },
             # Use mobile user agent to avoid bot detection
-            'user_agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+            'user_agent': 'Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36',
             'http_headers': {
-                'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip',
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-us,en;q=0.5',
-                'Sec-Fetch-Mode': 'navigate',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
             }
         }
 
         def extract():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(youtube_url, download=False)
+                info = ydl.extract_info(youtube_url, download=False)
+                return info
 
         info = await asyncio.get_event_loop().run_in_executor(None, extract)
         
-        if 'url' in info:
+        if info and 'url' in info:
+            logger.info(f"✅ yt-dlp got direct URL")
             return info['url']
-        elif 'formats' in info:
-            audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
+        elif info and 'formats' in info:
+            # Find the best audio format
+            audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
             if audio_formats:
-                best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
-                return best_audio['url']
+                # Prefer formats with known audio bitrate
+                best_audio = None
+                for fmt in audio_formats:
+                    if fmt.get('abr'):
+                        if not best_audio or fmt.get('abr', 0) > best_audio.get('abr', 0):
+                            best_audio = fmt
+                
+                if not best_audio and audio_formats:
+                    best_audio = audio_formats[0]
+                
+                if best_audio and 'url' in best_audio:
+                    logger.info(f"✅ yt-dlp got format URL with abr: {best_audio.get('abr')}")
+                    return best_audio['url']
         
+        logger.error("❌ yt-dlp could not extract audio URL")
         return None
     except Exception as e:
         logger.error(f"yt-dlp error: {e}")
@@ -335,55 +352,73 @@ async def stream_audio_to_buffer(audio_url: str):
     Stream audio data into circular buffer continuously.
     This runs ALWAYS, regardless of listeners.
     """
+    process = None
     try:
         logger.info(f"🎵 Starting FFmpeg stream for: {radio_state.current_track['title']}")
+        logger.info(f"🔗 Audio URL: {audio_url[:100]}...")
         
-        # FFmpeg command to convert any audio to MP3 stream
+        # FFmpeg command to convert any audio to MP3 stream with better error handling
         cmd = [
             'ffmpeg',
-            '-reconnect', '1',
-            '-reconnect_streamed', '1',
-            '-reconnect_delay_max', '5',
             '-i', audio_url,
-            '-vn',
+            '-vn',  # No video
             '-acodec', 'libmp3lame',
             '-b:a', '128k',
             '-ar', '44100',
             '-ac', '2',
             '-f', 'mp3',
-            'pipe:1',
+            '-',  # Output to stdout
         ]
 
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,  # Capture stderr for debugging
             bufsize=8192
         )
 
         radio_state.stream_process = process
         
         # Read and buffer audio chunks CONTINUOUSLY
+        chunk_count = 0
         while radio_state.is_streaming and process.poll() is None:
-            chunk = process.stdout.read(8192)
+            chunk = process.stdout.read(4096)  # Smaller chunks for better streaming
             if not chunk:
-                break
+                # Check if process ended
+                if process.poll() is not None:
+                    break
+                # Small delay before reading again
+                await asyncio.sleep(0.1)
+                continue
+            
+            chunk_count += 1
             
             # Store in circular buffer (always, even without listeners)
             async with radio_state.buffer_lock:
                 radio_state.audio_chunks.append(chunk)
-                radio_state.chunk_event.set()  # Notify listeners new chunk available
+                if chunk_count % 10 == 0:  # Set event every 10 chunks to avoid too many events
+                    radio_state.chunk_event.set()
+            
+            # Log progress occasionally
+            if chunk_count % 100 == 0:
+                logger.info(f"📦 Buffered {chunk_count} chunks for {radio_state.current_track['title']}")
             
             # Small delay to prevent CPU spinning
             await asyncio.sleep(0)
         
-        if process.poll() is None:
-            process.terminate()
-            
-        logger.info(f"✅ Finished streaming: {radio_state.current_track['title']}")
+        # Check why we exited the loop
+        if process.poll() is not None:
+            stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
+            if stderr_output:
+                logger.error(f"FFmpeg stderr: {stderr_output[:500]}")
+            logger.info(f"✅ FFmpeg process ended with code: {process.returncode}")
+        else:
+            logger.info(f"✅ Finished streaming: {radio_state.current_track['title']}")
         
     except Exception as e:
         logger.error(f"Streaming error: {e}")
+        if process and process.poll() is None:
+            process.terminate()
     finally:
         if process and process.poll() is None:
             process.terminate()
@@ -456,22 +491,37 @@ async def continuous_radio_loop():
     # Add default songs if playlist is empty
     if not radio_state.playlist:
         await add_default_songs()
+        # Wait a bit for playlist to populate
+        await asyncio.sleep(2)
     
     while radio_state.is_streaming:
         try:
             # Wait for playlist to have songs
+            wait_count = 0
             while not radio_state.playlist and radio_state.is_streaming:
-                logger.warning("⚠️ Playlist empty, waiting for songs...")
-                await asyncio.sleep(5)
+                if wait_count % 10 == 0:  # Log every 10 iterations
+                    logger.warning(f"⚠️ Playlist empty, waiting for songs... (attempt {wait_count + 1})")
+                await asyncio.sleep(1)
+                wait_count += 1
+                if wait_count > 30:  # 30 second timeout
+                    logger.error("❌ Timeout waiting for playlist, adding defaults")
+                    await add_default_songs()
+                    break
             
             if not radio_state.is_streaming:
                 break
+            
+            # Double-check playlist is not empty
+            if not radio_state.playlist:
+                logger.error("❌ Playlist still empty after waiting")
+                await asyncio.sleep(5)
+                continue
             
             # Get next track
             track = radio_state.playlist.popleft()
             radio_state.current_track = track
             
-            logger.info(f"▶️ NOW PLAYING: {track['title']} (Listeners: {len(radio_state.listeners)})")
+            logger.info(f"▶️ NOW PLAYING: {track['title']} (Duration: {track['duration']}s, Listeners: {len(radio_state.listeners)})")
             
             # Get audio stream URL using multiple fallback methods
             audio_url = await get_audio_stream_multi_source(track['url'])
@@ -481,6 +531,8 @@ async def continuous_radio_loop():
                 await stream_audio_to_buffer(audio_url)
             else:
                 logger.warning(f"⚠️ Could not get audio for: {track['title']}")
+                # Put track back at the end of playlist to retry later
+                radio_state.playlist.append(track)
                 await asyncio.sleep(2)
             
             # Track finished, continue to next
@@ -540,11 +592,14 @@ async def startup_event():
     await youtube_service.init_session()
     
     # Give session time to initialize
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)
     
     # Add default songs before starting stream
     if not radio_state.playlist:
         await add_default_songs()
+    
+    # Wait a bit for playlist to populate
+    await asyncio.sleep(1)
     
     # Auto-start streaming
     if radio_state.playlist:
@@ -640,7 +695,7 @@ async def stream_radio():
             # Start from current buffer position (live join)
             buffer_position = max(0, len(radio_state.audio_chunks) - 10)  # Start near end
             
-            while True:
+            while radio_state.is_streaming:
                 # Get current buffer size
                 async with radio_state.buffer_lock:
                     current_buffer_size = len(radio_state.audio_chunks)
@@ -665,6 +720,8 @@ async def stream_radio():
             radio_state.listeners.discard(listener_id)
         except Exception as e:
             logger.error(f"Stream error: {e}")
+            radio_state.listeners.discard(listener_id)
+        finally:
             radio_state.listeners.discard(listener_id)
     
     return StreamingResponse(
