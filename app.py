@@ -24,7 +24,6 @@ class RadioState:
         self.current_audio_url = None
         self.audio_buffer = deque(maxlen=1000)  # Circular buffer for audio chunks
         self.listeners = set()  # Track active listeners
-        self.buffer_position = 0  # Current position in buffer
         self.buffer_lock = asyncio.Lock()
         self.chunk_event = asyncio.Event()  # Signal when new audio is available
         self.stream_process = None  # FFmpeg process
@@ -74,6 +73,19 @@ class YouTubeAPIService:
         except ImportError:
             logger.warning("⚠️ yt-dlp not installed, using fallback methods")
             return False
+
+    def extract_video_id(self, url: str) -> Optional[str]:
+        """Extract YouTube video ID from various URL formats."""
+        patterns = [
+            r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&?/]+)',
+            r'youtube\.com/embed/([^?]+)',
+            r'^([a-zA-Z0-9_-]{11})$',  # Direct video ID
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return None
 
     async def search_music(self, query: str, limit: int = 10) -> List[Dict]:
         """Search for music videos using YouTube Data API with aiohttp."""
@@ -200,9 +212,9 @@ class YouTubeAPIService:
             video_id = self.extract_video_id(youtube_url)
             if not video_id:
                 return None
-    
+
             logger.info(f"🎵 Getting audio stream for: {video_id}")
-    
+
             # Method 1: Try yt-dlp with mobile user agent to avoid bot detection
             if self.has_ytdlp:
                 try:
@@ -230,12 +242,12 @@ class YouTubeAPIService:
                             }
                         },
                     }
-    
+
                     def extract_info():
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(youtube_url, download=False)
                             return info
-    
+
                     info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
                     
                     if info and 'url' in info:
@@ -261,181 +273,83 @@ class YouTubeAPIService:
                         
                 except Exception as e:
                     logger.error(f"❌ yt-dlp failed: {str(e)[:100]}")
-    
+
             # Method 2: Try Piped API (alternative to Invidious)
             piped_url = await self.get_piped_stream(video_id)
             if piped_url:
                 return piped_url
-    
+
             # Method 3: Try different Invidious instances
             invidious_url = await self.get_invidious_stream_fallback(video_id)
             if invidious_url:
                 return invidious_url
-    
+
             logger.error("❌ All audio stream methods failed")
             return None
-    
+
         except Exception as e:
             logger.error(f"❌ Audio stream error: {e}")
             return None
 
-async def get_piped_stream(self, video_id: str) -> Optional[str]:
-    """Try Piped API instances."""
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.in.projectsegfau.lt", 
-        "https://api.piped.privacydev.net",
-    ]
+    async def get_piped_stream(self, video_id: str) -> Optional[str]:
+        """Try Piped API instances."""
+        piped_instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.in.projectsegfau.lt", 
+            "https://api.piped.privacydev.net",
+        ]
 
-    for instance in piped_instances:
-        try:
-            logger.info(f"🔍 Trying Piped: {instance}")
-            async with http_session.get(
-                f"{instance}/streams/{video_id}",
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    audio_streams = data.get('audioStreams', [])
-                    if audio_streams:
-                        # Get the best quality audio
-                        best_audio = max(audio_streams, key=lambda x: x.get('bitrate', 0))
-                        logger.info(f"✅ Stream via Piped: {instance}")
-                        return best_audio['url']
-        except Exception as e:
-            logger.warning(f"❌ Piped {instance} failed: {e}")
-            continue
+        for instance in piped_instances:
+            try:
+                logger.info(f"🔍 Trying Piped: {instance}")
+                async with http_session.get(
+                    f"{instance}/streams/{video_id}",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        audio_streams = data.get('audioStreams', [])
+                        if audio_streams:
+                            # Get the best quality audio
+                            best_audio = max(audio_streams, key=lambda x: x.get('bitrate', 0))
+                            logger.info(f"✅ Stream via Piped: {instance}")
+                            return best_audio['url']
+            except Exception as e:
+                logger.warning(f"❌ Piped {instance} failed: {e}")
+                continue
 
-    return None
+        return None
 
-async def get_invidious_stream_fallback(self, video_id: str) -> Optional[str]:
-    """Try multiple Invidious instances with better error handling."""
-    invidious_instances = [
-        "https://yt.artemislena.eu",
-        "https://invidious.flokinet.to", 
-        "https://inv.nadeko.net",
-        "https://yewtu.be",
-    ]
-
-    for instance in invidious_instances:
-        try:
-            logger.info(f"🔍 Trying Invidious: {instance}")
-            async with http_session.get(
-                f"{instance}/api/v1/videos/{video_id}",
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    adaptive_formats = data.get('adaptiveFormats', [])
-                    audio_formats = [f for f in adaptive_formats if 'audio' in f.get('type', '')]
-                    if audio_formats:
-                        best_audio = max(audio_formats, key=lambda x: x.get('bitrate', 0))
-                        logger.info(f"✅ Stream via Invidious: {instance}")
-                        return best_audio['url']
-        except Exception as e:
-            logger.warning(f"❌ Invidious {instance} failed: {e}")
-            continue
-
-    return None
-    async def get_invidious_stream(self, video_id: str) -> Optional[str]:
-        """Try Invidious public instances for audio stream."""
+    async def get_invidious_stream_fallback(self, video_id: str) -> Optional[str]:
+        """Try multiple Invidious instances with better error handling."""
         invidious_instances = [
-            "https://invidious.privacydev.net",
-            "https://inv.tux.pizza",
+            "https://yt.artemislena.eu",
+            "https://invidious.flokinet.to", 
+            "https://inv.nadeko.net",
+            "https://yewtu.be",
         ]
 
         for instance in invidious_instances:
             try:
+                logger.info(f"🔍 Trying Invidious: {instance}")
                 async with http_session.get(
                     f"{instance}/api/v1/videos/{video_id}",
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
-                        audio_formats = [f for f in data.get('adaptiveFormats', []) 
-                                       if 'audio' in f.get('type', '')]
+                        adaptive_formats = data.get('adaptiveFormats', [])
+                        audio_formats = [f for f in adaptive_formats if 'audio' in f.get('type', '')]
                         if audio_formats:
                             best_audio = max(audio_formats, key=lambda x: x.get('bitrate', 0))
                             logger.info(f"✅ Stream via Invidious: {instance}")
                             return best_audio['url']
             except Exception as e:
-                logger.error(f"❌ Invidious {instance} failed: {e}")
+                logger.warning(f"❌ Invidious {instance} failed: {e}")
                 continue
 
         return None
 
-    def extract_video_id(self, url: str) -> Optional[str]:
-        """Extract YouTube video ID from various URL formats."""
-        patterns = [
-            r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&?/]+)',
-            r'youtube\.com/embed/([^?]+)',
-            r'^([a-zA-Z0-9_-]{11})$',  # Direct video ID
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        return None
-    async def stream_audio_to_buffer_direct(audio_url: str):
-        """Alternative streaming method using direct HTTP streaming."""
-        try:
-            logger.info(f"🎵 Starting direct HTTP stream: {audio_url[:100]}...")
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': '*/*',
-                'Range': 'bytes=0-',
-            }
-            
-            radio_state.is_streaming = True
-            chunk_count = 0
-            
-            async with http_session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as response:
-                if response.status != 200:
-                    logger.error(f"❌ HTTP stream failed with status: {response.status}")
-                    return
-                    
-                logger.info("✅ HTTP stream connected, starting to read...")
-                
-                async for chunk in response.content.iter_chunked(4096):
-                    if not radio_state.is_streaming:
-                        break
-                        
-                    if chunk:
-                        chunk_count += 1
-                        
-                        # Add to circular buffer
-                        async with radio_state.buffer_lock:
-                            radio_state.audio_buffer.append(chunk)
-                            if chunk_count % 10 == 0:
-                                radio_state.chunk_event.set()
-                        
-                        # Log progress
-                        if chunk_count % 100 == 0:
-                            logger.info(f"📦 Direct stream buffered {chunk_count} chunks")
-                
-            logger.info(f"✅ Direct HTTP stream completed, {chunk_count} chunks")
-            
-        except asyncio.TimeoutError:
-            logger.error("❌ Direct HTTP stream timeout")
-        except Exception as e:
-            logger.error(f"❌ Direct stream error: {e}")
-        finally:
-            radio_state.is_streaming = False
-    async def stream_with_fallback(video_id: str):
-        """Simple fallback streaming for popular songs."""
-        fallback_tracks = {
-            'kJQP7kiw5Fk': 'https://www.soundjay.com/music/summer-walk-01.mp3',  # Despacito fallback
-            'fJ9rUzIMcZQ': 'https://www.soundjay.com/music/action-songs-01.mp3', # Bohemian Rhapsody fallback
-            'WpBn9w-Js_c': 'https://www.soundjay.com/music/action-songs-01.mp3', # Your Marathi song fallback
-        }
-        
-        fallback_url = fallback_tracks.get(video_id)
-        if fallback_url:
-            logger.info(f"🎵 Using fallback audio for: {video_id}")
-            return fallback_url
-        
-        return None
 # Initialize YouTube service
 youtube_service = YouTubeAPIService()
 
@@ -530,7 +444,22 @@ async def stream_audio_to_buffer(audio_url: str):
         logger.error("❌ Max retries reached, stopping stream")
     
     radio_state.is_streaming = False
+
+async def stream_with_fallback(video_id: str):
+    """Simple fallback streaming for popular songs."""
+    fallback_tracks = {
+        'kJQP7kiw5Fk': 'https://www.soundjay.com/music/summer-walk-01.mp3',  # Despacito fallback
+        'fJ9rUzIMcZQ': 'https://www.soundjay.com/music/action-songs-01.mp3', # Bohemian Rhapsody fallback
+        'WpBn9w-Js_c': 'https://www.soundjay.com/music/action-songs-01.mp3', # Your Marathi song fallback
+    }
     
+    fallback_url = fallback_tracks.get(video_id)
+    if fallback_url:
+        logger.info(f"🎵 Using fallback audio for: {video_id}")
+        return fallback_url
+    
+    return None
+
 # API Endpoints
 @app.get("/")
 async def root():
@@ -608,6 +537,7 @@ async def play_music(video_url: str = Form(...)):
     except Exception as e:
         logger.error(f"❌ Play error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/stream")
 async def stream_audio():
     """Live broadcast stream - all users hear the same audio at the same time."""
@@ -678,7 +608,6 @@ async def stop_music():
     # Clear buffer
     async with radio_state.buffer_lock:
         radio_state.audio_buffer.clear()
-        radio_state.buffer_position = 0
     
     logger.info("🛑 Music stopped")
     return {
