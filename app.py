@@ -258,6 +258,62 @@ async def stream_audio_to_buffer(audio_url: str):
         if process and process.poll() is None:
             process.terminate()
 
+async def add_default_songs():
+    """Add default songs to playlist on startup"""
+    logger.info("📋 Adding default tracks to playlist...")
+    
+    # Try with YouTube API first
+    if YOUTUBE_API_KEY:
+        default_songs = [
+            "kJQP7kiw5Fk",  # Despacito
+            "fJ9rUzIMcZQ",  # Bohemian Rhapsody
+            "RgKAFK5djSk",  # Wiz Khalifa - See You Again
+            "CevxZvSJLk8",  # Katy Perry - Roar
+            "OPf0YbXqDm0",  # Mark Ronson - Uptown Funk
+        ]
+        
+        for video_id in default_songs:
+            try:
+                info = await youtube_service.get_video_info(video_id)
+                if info:
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    radio_state.playlist.append({**info, 'url': url})
+                    logger.info(f"✅ Added: {info['title']}")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"❌ Failed to add {video_id}: {e}")
+        
+        if radio_state.playlist:
+            logger.info(f"📋 Playlist ready with {len(radio_state.playlist)} songs")
+            return
+    
+    # Fallback: Add songs manually without full metadata
+    logger.warning("⚠️ YouTube API unavailable, using fallback songs")
+    fallback_songs = [
+        {
+            'id': 'kJQP7kiw5Fk',
+            'title': 'Luis Fonsi - Despacito',
+            'url': 'https://www.youtube.com/watch?v=kJQP7kiw5Fk',
+            'duration': 280,
+            'thumbnail': '',
+            'artist': 'Luis Fonsi',
+        },
+        {
+            'id': 'fJ9rUzIMcZQ',
+            'title': 'Queen - Bohemian Rhapsody',
+            'url': 'https://www.youtube.com/watch?v=fJ9rUzIMcZQ',
+            'duration': 354,
+            'thumbnail': '',
+            'artist': 'Queen',
+        },
+    ]
+    
+    for song in fallback_songs:
+        radio_state.playlist.append(song)
+        logger.info(f"✅ Added (fallback): {song['title']}")
+    
+    logger.info(f"📋 Fallback playlist ready with {len(radio_state.playlist)} songs")
+
 async def continuous_radio_loop():
     """
     Main radio loop - plays songs continuously in background.
@@ -267,19 +323,9 @@ async def continuous_radio_loop():
     radio_state.is_streaming = True
     radio_state.stream_started_at = datetime.now()
     
-    # Add some default songs if playlist is empty
+    # Add default songs if playlist is empty
     if not radio_state.playlist:
-        logger.info("📋 Playlist empty, adding default tracks...")
-        default_songs = [
-            "https://www.youtube.com/watch?v=kJQP7kiw5Fk",  # Despacito
-            "https://www.youtube.com/watch?v=fJ9rUzIMcZQ",  # Bohemian Rhapsody
-        ]
-        for url in default_songs:
-            video_id = youtube_service.extract_video_id(url)
-            if video_id:
-                info = await youtube_service.get_video_info(video_id)
-                if info:
-                    radio_state.playlist.append({**info, 'url': url})
+        await add_default_songs()
     
     while radio_state.is_streaming:
         try:
@@ -360,12 +406,23 @@ async def stop_continuous_stream():
 @app.on_event("startup")
 async def startup_event():
     """Initialize and auto-start stream on startup"""
+    logger.info("🚀 API Starting...")
     await youtube_service.init_session()
     
-    # Auto-start streaming on startup
-    await start_continuous_stream()
+    # Give session time to initialize
+    await asyncio.sleep(1)
     
-    logger.info("🚀 API Started - Radio streaming 24/7")
+    # Add default songs before starting stream
+    if not radio_state.playlist:
+        await add_default_songs()
+    
+    # Auto-start streaming
+    if radio_state.playlist:
+        await start_continuous_stream()
+        logger.info("🚀 API Started - Radio streaming 24/7")
+    else:
+        logger.warning("⚠️ Could not add default songs. Use !play to add music.")
+        logger.info("🚀 API Started - Waiting for songs")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -505,8 +562,25 @@ async def stop_stream():
 @app.post("/api/start")
 async def start_stream():
     """Manually start the stream if stopped"""
+    if not radio_state.playlist:
+        await add_default_songs()
+    
     await start_continuous_stream()
-    return {"status": "started", "message": "Radio stream started"}
+    return {
+        "status": "started",
+        "message": "Radio stream started",
+        "playlist_size": len(radio_state.playlist)
+    }
+
+@app.post("/api/add-defaults")
+async def add_defaults():
+    """Manually add default songs to playlist"""
+    await add_default_songs()
+    return {
+        "status": "success",
+        "playlist_size": len(radio_state.playlist),
+        "message": f"Added default songs. Playlist now has {len(radio_state.playlist)} tracks"
+    }
 
 @app.get("/api/status")
 async def get_status():
