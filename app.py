@@ -395,52 +395,7 @@ async def stream_audio_to_buffer(audio_url: str):
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-async def stream_audio_to_buffer_direct(audio_url: str):
-    """Alternative streaming method using direct HTTP streaming."""
-    try:
-        logger.info(f"🎵 Starting direct HTTP stream: {audio_url[:100]}...")
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Range': 'bytes=0-',
-        }
-        
-        radio_state.is_streaming = True
-        chunk_count = 0
-        
-        async with http_session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as response:
-            if response.status != 200:
-                logger.error(f"❌ HTTP stream failed with status: {response.status}")
-                return
-                
-            logger.info("✅ HTTP stream connected, starting to read...")
-            
-            async for chunk in response.content.iter_chunked(4096):
-                if not radio_state.is_streaming:
-                    break
-                    
-                if chunk:
-                    chunk_count += 1
-                    
-                    # Add to circular buffer
-                    async with radio_state.buffer_lock:
-                        radio_state.audio_buffer.append(chunk)
-                        if chunk_count % 10 == 0:
-                            radio_state.chunk_event.set()
-                    
-                    # Log progress
-                    if chunk_count % 100 == 0:
-                        logger.info(f"📦 Direct stream buffered {chunk_count} chunks")
-            
-        logger.info(f"✅ Direct HTTP stream completed, {chunk_count} chunks")
-        
-    except asyncio.TimeoutError:
-        logger.error("❌ Direct HTTP stream timeout")
-    except Exception as e:
-        logger.error(f"❌ Direct stream error: {e}")
-    finally:
-        radio_state.is_streaming = False
+
 # API Endpoints
 @app.get("/")
 async def root():
