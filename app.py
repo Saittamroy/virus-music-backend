@@ -182,10 +182,10 @@ class YouTubeAPIService:
             video_id = self.extract_video_id(youtube_url)
             if not video_id:
                 return None
-
+    
             logger.info(f"🎵 Getting stream for: {video_id}")
-
-            # Try yt-dlp with anti-bot config
+    
+            # Try yt-dlp with cookies/anti-bot measures
             if self.has_ytdlp:
                 try:
                     import yt_dlp
@@ -200,14 +200,18 @@ class YouTubeAPIService:
                             }
                         },
                         'http_headers': {
-                            'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11)',
-                        }
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        },
+                        # Add retry for bot detection
+                        'retries': 3,
+                        'fragment_retries': 3,
+                        'skip_download': True,
                     }
-
+    
                     def extract_info():
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             return ydl.extract_info(youtube_url, download=False)
-
+    
                     info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
                     
                     if 'url' in info:
@@ -222,14 +226,15 @@ class YouTubeAPIService:
                             
                 except Exception as e:
                     logger.error(f"❌ yt-dlp failed: {e}")
-
-            # Try Invidious
+                    # Fall through to Invidious
+    
+            # Try Invidious as fallback
             invidious_url = await self.get_invidious_stream(video_id)
             if invidious_url:
                 return invidious_url
-
+    
             return None
-
+    
         except Exception as e:
             logger.error(f"❌ Stream error: {e}")
             return None
@@ -293,15 +298,15 @@ async def stream_audio_to_buffer(audio_url: str):
             '-ar', '44100',
             '-ac', '2',
             '-f', 'mp3',
-            '-bufsize', '256k',  # Internal buffer
+            '-bufsize', '256k',
             'pipe:1'
         ]
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0  # Unbuffered
+        # Use asyncio subprocess for proper async handling
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
 
         radio_state.stream_process = process
@@ -312,16 +317,13 @@ async def stream_audio_to_buffer(audio_url: str):
         chunk_count = 0
         
         # Read audio continuously until process ends or stopped
-        while radio_state.is_streaming:
-            # Check if process is still running
-            if process.poll() is not None:
-                logger.warning("⚠️ FFmpeg process ended")
-                break
-            
+        while radio_state.is_streaming and process.returncode is None:
             try:
-                chunk = process.stdout.read(8192)
+                # Read chunk asynchronously with timeout
+                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=5.0)
+                
                 if not chunk:
-                    logger.warning("⚠️ No more data from FFmpeg")
+                    logger.warning("⚠️ No more data from FFmpeg (EOF)")
                     break
                 
                 chunk_count += 1
@@ -335,8 +337,9 @@ async def stream_audio_to_buffer(audio_url: str):
                 if chunk_count % 100 == 0:
                     logger.info(f"📊 Buffered {chunk_count} chunks, buffer size: {len(radio_state.audio_buffer)}")
                 
-                await asyncio.sleep(0)  # Allow other tasks to run
-                
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Timeout reading from FFmpeg")
+                continue
             except Exception as e:
                 logger.error(f"❌ Chunk read error: {e}")
                 break
@@ -347,18 +350,22 @@ async def stream_audio_to_buffer(audio_url: str):
         logger.error(f"❌ Stream to buffer error: {e}")
     finally:
         radio_state.is_streaming = False
-        if process and process.poll() is None:
+        if process and process.returncode is None:
             process.terminate()
             try:
-                process.wait(timeout=2)
-            except:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
                 process.kill()
+                await process.wait()
         
         # Check stderr for FFmpeg errors
-        if process:
-            stderr = process.stderr.read()
-            if stderr:
-                logger.error(f"FFmpeg stderr: {stderr.decode('utf-8', errors='ignore')[:500]}")
+        if process.stderr:
+            try:
+                stderr_output = await process.stderr.read()
+                if stderr_output:
+                    logger.error(f"FFmpeg stderr: {stderr_output.decode('utf-8', errors='ignore')[:500]}")
+            except Exception as e:
+                logger.error(f"Could not read stderr: {e}")
 
 # API Endpoints
 @app.get("/")
@@ -525,9 +532,10 @@ async def stop_music():
     if radio_state.stream_process:
         radio_state.stream_process.terminate()
         try:
-            radio_state.stream_process.wait(timeout=2)
-        except:
+            await asyncio.wait_for(radio_state.stream_process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
             radio_state.stream_process.kill()
+            await radio_state.stream_process.wait()
     
     radio_state.current_track = None
     radio_state.player_status = "stopped"
