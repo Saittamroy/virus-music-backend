@@ -195,14 +195,14 @@ class YouTubeAPIService:
             return None
 
     async def get_audio_stream_url(self, youtube_url: str) -> Optional[str]:
-        """Get audio stream URL with multiple fallback methods."""
+    """Get audio stream URL with multiple fallback methods."""
         try:
             video_id = self.extract_video_id(youtube_url)
             if not video_id:
                 return None
-
+    
             logger.info(f"🎵 Getting audio stream for: {video_id}")
-
+    
             # Try yt-dlp if available
             if self.has_ytdlp:
                 try:
@@ -211,37 +211,59 @@ class YouTubeAPIService:
                         'format': 'bestaudio/best',
                         'quiet': True,
                         'noplaylist': True,
+                        'no_warnings': True,
                         'extract_flat': False,
+                        'socket_timeout': 30,
+                        'extractor_args': {
+                            'youtube': {
+                                'player_client': ['android', 'web'],
+                                'skip': ['hls', 'dash']
+                            }
+                        },
+                        'http_headers': {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                            'Accept': '*/*',
+                            'Accept-Language': 'en-us,en;q=0.5',
+                        }
                     }
-
+    
                     def extract_info():
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            return ydl.extract_info(youtube_url, download=False)
-
-                    info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
-                    
-                    # Get best audio format
-                    if 'url' in info:
-                        logger.info("✅ Stream via yt-dlp (direct)")
-                        return info['url']
-                    elif 'formats' in info:
-                        audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
-                        if audio_formats:
-                            best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
-                            logger.info("✅ Stream via yt-dlp (format selection)")
-                            return best_audio['url']
-                            
+                            info = ydl.extract_info(youtube_url, download=False)
+                            # Try to get the most reliable URL
+                            if 'url' in info:
+                                return info['url']
+                            elif 'formats' in info:
+                                # Prefer audio-only formats
+                                audio_formats = [f for f in info['formats'] 
+                                               if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+                                if audio_formats:
+                                    best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
+                                    logger.info(f"✅ Selected audio format: {best_audio.get('format_note', 'unknown')}")
+                                    return best_audio['url']
+                                # Fallback to any format with audio
+                                any_audio = [f for f in info['formats'] if f.get('acodec') != 'none']
+                                if any_audio:
+                                    best = max(any_audio, key=lambda x: x.get('abr', 0) or 0)
+                                    return best['url']
+                            return None
+    
+                    audio_url = await asyncio.get_event_loop().run_in_executor(None, extract_info)
+                    if audio_url:
+                        logger.info("✅ Stream via yt-dlp")
+                        return audio_url
+                        
                 except Exception as e:
                     logger.error(f"❌ yt-dlp failed: {e}")
-
+    
             # Try Invidious public instances
             invidious_url = await self.get_invidious_stream(video_id)
             if invidious_url:
                 return invidious_url
-
+    
             logger.error("❌ All audio stream methods failed")
             return None
-
+    
         except Exception as e:
             logger.error(f"❌ Audio stream error: {e}")
             return None
@@ -291,19 +313,25 @@ youtube_service = YouTubeAPIService()
 
 async def stream_audio_to_buffer(audio_url: str):
     """Stream audio continuously to buffer using FFmpeg."""
+    process = None
     try:
-        logger.info("🎵 Starting continuous audio stream to buffer")
+        logger.info(f"🎵 Starting continuous audio stream to buffer: {audio_url[:100]}...")
         
-        # FFmpeg command to stream audio to MP3
+        # Improved FFmpeg command with better error handling
         cmd = [
             'ffmpeg',
             '-i', audio_url,
+            '-reconnect', '1',
+            '-reconnect_streamed', '1', 
+            '-reconnect_delay_max', '5',
             '-vn',
             '-acodec', 'libmp3lame',
             '-b:a', '128k',
             '-ar', '44100',
             '-ac', '2',
             '-f', 'mp3',
+            '-fflags', '+nobuffer',
+            '-flags', 'low_delay',
             'pipe:1'
         ]
 
@@ -317,31 +345,102 @@ async def stream_audio_to_buffer(audio_url: str):
         radio_state.stream_process = process
         radio_state.is_streaming = True
         
+        logger.info("✅ FFmpeg process started, beginning to read audio...")
+        
         # Continuously read audio and add to buffer
+        chunk_count = 0
         while radio_state.is_streaming and process.poll() is None:
             chunk = process.stdout.read(4096)
             if not chunk:
-                break
+                # Check if process has ended
+                if process.poll() is not None:
+                    break
+                # Small delay before trying again
+                await asyncio.sleep(0.1)
+                continue
+            
+            chunk_count += 1
             
             # Add to circular buffer
             async with radio_state.buffer_lock:
                 radio_state.audio_buffer.append(chunk)
-                radio_state.chunk_event.set()  # Notify listeners
+                if chunk_count % 10 == 0:  # Set event periodically
+                    radio_state.chunk_event.set()
             
-            await asyncio.sleep(0.01)  # Small delay to prevent CPU overload
+            # Log progress
+            if chunk_count % 100 == 0:
+                logger.info(f"📦 Buffered {chunk_count} chunks")
+            
+            await asyncio.sleep(0.01)
         
-        if process.poll() is None:
-            process.terminate()
-            
-        logger.info("🛑 Audio streaming stopped")
+        # Check why we exited
+        return_code = process.poll()
+        if return_code is not None:
+            stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
+            if stderr_output:
+                logger.error(f"❌ FFmpeg stderr: {stderr_output[:500]}")
+            logger.error(f"❌ FFmpeg process ended with code: {return_code}")
+        else:
+            logger.info("🛑 Audio streaming stopped by request")
         
     except Exception as e:
         logger.error(f"❌ Stream to buffer error: {e}")
+        if process and process.poll() is None:
+            process.stderr.read()  # Clear stderr
     finally:
         radio_state.is_streaming = False
         if process and process.poll() is None:
             process.terminate()
-
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+async def stream_audio_to_buffer_direct(audio_url: str):
+    """Alternative streaming method using direct HTTP streaming."""
+    try:
+        logger.info(f"🎵 Starting direct HTTP stream: {audio_url[:100]}...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': '*/*',
+            'Range': 'bytes=0-',
+        }
+        
+        radio_state.is_streaming = True
+        chunk_count = 0
+        
+        async with http_session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as response:
+            if response.status != 200:
+                logger.error(f"❌ HTTP stream failed with status: {response.status}")
+                return
+                
+            logger.info("✅ HTTP stream connected, starting to read...")
+            
+            async for chunk in response.content.iter_chunked(4096):
+                if not radio_state.is_streaming:
+                    break
+                    
+                if chunk:
+                    chunk_count += 1
+                    
+                    # Add to circular buffer
+                    async with radio_state.buffer_lock:
+                        radio_state.audio_buffer.append(chunk)
+                        if chunk_count % 10 == 0:
+                            radio_state.chunk_event.set()
+                    
+                    # Log progress
+                    if chunk_count % 100 == 0:
+                        logger.info(f"📦 Direct stream buffered {chunk_count} chunks")
+            
+        logger.info(f"✅ Direct HTTP stream completed, {chunk_count} chunks")
+        
+    except asyncio.TimeoutError:
+        logger.error("❌ Direct HTTP stream timeout")
+    except Exception as e:
+        logger.error(f"❌ Direct stream error: {e}")
+    finally:
+        radio_state.is_streaming = False
 # API Endpoints
 @app.get("/")
 async def root():
@@ -397,7 +496,7 @@ async def play_music(video_url: str = Form(...)):
         radio_state.current_audio_url = audio_url
         radio_state.player_status = "playing"
 
-        # Start streaming to buffer in background
+        # Try FFmpeg streaming first, fallback to direct HTTP
         asyncio.create_task(stream_audio_to_buffer(audio_url))
 
         base_url = os.getenv("BASE_URL", "https://virus-music-backend-production.up.railway.app")
@@ -415,7 +514,6 @@ async def play_music(video_url: str = Form(...)):
     except Exception as e:
         logger.error(f"❌ Play error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/stream")
 async def stream_audio():
     """Live broadcast stream - all users hear the same audio at the same time."""
