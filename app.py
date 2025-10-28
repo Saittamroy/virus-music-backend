@@ -28,6 +28,8 @@ class RadioState:
         self.chunk_event = asyncio.Event()  # Signal when new audio is available
         self.stream_process = None  # FFmpeg process
         self.is_streaming = False
+        self.playlist = deque()  # Queue for continuous playback
+        self.stream_task = None  # Background streaming task
 
 radio_state = RadioState()
 
@@ -40,11 +42,18 @@ async def lifespan(app: FastAPI):
     """Manage aiohttp session lifecycle"""
     global http_session
     http_session = aiohttp.ClientSession()
+    
+    # Add some default songs to playlist on startup
+    await add_default_songs()
+    
     yield
+    
+    # Cleanup
     await http_session.close()
-    # Cleanup streaming process
     if radio_state.stream_process:
         radio_state.stream_process.terminate()
+    if radio_state.stream_task:
+        radio_state.stream_task.cancel()
 
 app = FastAPI(
     title="Virus Music Radio API",
@@ -353,13 +362,71 @@ class YouTubeAPIService:
 # Initialize YouTube service
 youtube_service = YouTubeAPIService()
 
+async def add_default_songs():
+    """Add default songs to playlist on startup."""
+    default_songs = [
+        "https://www.youtube.com/watch?v=kJQP7kiw5Fk",  # Despacito
+        "https://www.youtube.com/watch?v=fJ9rUzIMcZQ",  # Bohemian Rhapsody
+        "https://www.youtube.com/watch?v=JGwWNGJdvx8",  # Shape of You
+    ]
+    
+    for url in default_songs:
+        video_id = youtube_service.extract_video_id(url)
+        if video_id:
+            info = await youtube_service.get_video_info(video_id)
+            if info:
+                radio_state.playlist.append({**info, 'url': url})
+                logger.info(f"✅ Added to playlist: {info['title']}")
+    
+    if radio_state.playlist:
+        logger.info(f"📋 Playlist initialized with {len(radio_state.playlist)} songs")
+        # Start continuous streaming
+        asyncio.create_task(continuous_stream_loop())
+
+async def continuous_stream_loop():
+    """Continuous streaming loop that plays music 24/7 regardless of listeners."""
+    logger.info("🎵 Starting continuous radio stream (24/7 mode)")
+    
+    while True:
+        try:
+            # Wait for playlist to have songs
+            while not radio_state.playlist:
+                logger.warning("⚠️ Playlist empty, waiting for songs...")
+                await asyncio.sleep(5)
+            
+            # Get next track from playlist
+            track = radio_state.playlist.popleft()
+            radio_state.current_track = track
+            radio_state.player_status = "playing"
+            
+            logger.info(f"▶️ NOW PLAYING: {track['title']} (Listeners: {len(radio_state.listeners)})")
+            
+            # Get audio stream URL
+            audio_url = await youtube_service.get_audio_stream_url(track['url'])
+            
+            if audio_url:
+                # Stream this track
+                await stream_audio_to_buffer(audio_url)
+            else:
+                logger.warning(f"⚠️ Could not get audio for: {track['title']}")
+                # Put track back at end of playlist
+                radio_state.playlist.append(track)
+                await asyncio.sleep(2)
+            
+            # Track finished, continue to next
+            logger.info(f"✅ Track completed: {track['title']}")
+            
+        except Exception as e:
+            logger.error(f"❌ Radio loop error: {e}")
+            await asyncio.sleep(1)
+
 async def stream_audio_to_buffer(audio_url: str):
-    """Stream audio continuously to buffer using FFmpeg with URL refresh."""
+    """Stream audio continuously to buffer using FFmpeg."""
     process = None
-    max_retries = 3
+    max_retries = 2
     retry_count = 0
     
-    while retry_count < max_retries and radio_state.is_streaming:
+    while retry_count < max_retries and radio_state.player_status == "playing":
         try:
             logger.info(f"🎵 Starting audio stream (attempt {retry_count + 1}/{max_retries})")
             
@@ -391,6 +458,7 @@ async def stream_audio_to_buffer(audio_url: str):
             )
 
             radio_state.stream_process = process
+            radio_state.is_streaming = True
             
             logger.info("✅ FFmpeg process started")
             
@@ -398,7 +466,7 @@ async def stream_audio_to_buffer(audio_url: str):
             chunk_count = 0
             start_time = asyncio.get_event_loop().time()
             
-            while radio_state.is_streaming and process.poll() is None:
+            while radio_state.player_status == "playing" and process.poll() is None:
                 chunk = process.stdout.read(4096)
                 if not chunk:
                     if process.poll() is not None:
@@ -414,10 +482,10 @@ async def stream_audio_to_buffer(audio_url: str):
                     if chunk_count % 3 == 0:  # Frequent updates for live streaming
                         radio_state.chunk_event.set()
                 
-                # Log progress
+                # Log progress every 10 seconds
                 current_time = asyncio.get_event_loop().time()
-                if current_time - start_time >= 5.0:  # Log every 5 seconds
-                    logger.info(f"📦 Live streaming: {chunk_count} chunks")
+                if current_time - start_time >= 10.0:
+                    logger.info(f"📦 Streaming: {chunk_count} chunks (Listeners: {len(radio_state.listeners)})")
                     start_time = current_time
                 
                 await asyncio.sleep(0.001)
@@ -430,7 +498,7 @@ async def stream_audio_to_buffer(audio_url: str):
             else:
                 logger.warning(f"⚠️ Stream interrupted, retrying... (code: {return_code})")
                 retry_count += 1
-                await asyncio.sleep(2)  # Wait before retry
+                await asyncio.sleep(2)
                 
         except Exception as e:
             logger.error(f"❌ Stream error: {e}")
@@ -441,38 +509,26 @@ async def stream_audio_to_buffer(audio_url: str):
                 process.terminate()
     
     if retry_count >= max_retries:
-        logger.error("❌ Max retries reached, stopping stream")
+        logger.error("❌ Max retries reached, moving to next track")
     
     radio_state.is_streaming = False
-
-async def stream_with_fallback(video_id: str):
-    """Simple fallback streaming for popular songs."""
-    fallback_tracks = {
-        'kJQP7kiw5Fk': 'https://www.soundjay.com/music/summer-walk-01.mp3',  # Despacito fallback
-        'fJ9rUzIMcZQ': 'https://www.soundjay.com/music/action-songs-01.mp3', # Bohemian Rhapsody fallback
-        'WpBn9w-Js_c': 'https://www.soundjay.com/music/action-songs-01.mp3', # Your Marathi song fallback
-    }
-    
-    fallback_url = fallback_tracks.get(video_id)
-    if fallback_url:
-        logger.info(f"🎵 Using fallback audio for: {video_id}")
-        return fallback_url
-    
-    return None
 
 # API Endpoints
 @app.get("/")
 async def root():
     return {
-        "message": "Virus Music Radio API (Live Broadcasting)",
+        "message": "Virus Music Radio API (24/7 Live Broadcasting)",
         "status": "online",
         "version": "4.3.0",
         "listeners": len(radio_state.listeners),
         "streaming": radio_state.is_streaming,
+        "current_track": radio_state.current_track['title'] if radio_state.current_track else None,
+        "playlist_size": len(radio_state.playlist),
         "features": {
             "yt_dlp": youtube_service.has_ytdlp,
             "youtube_api": bool(YOUTUBE_API_KEY),
-            "live_broadcast": True
+            "live_broadcast": True,
+            "continuous_playback": True
         }
     }
 
@@ -485,9 +541,9 @@ async def search_music(q: str = Query(..., min_length=1), limit: int = Query(10,
 
 @app.post("/api/play")
 async def play_music(video_url: str = Form(...)):
-    global http_session
+    """Add song to playlist and ensure streaming is active."""
     try:
-        logger.info(f"🎵 Play request: {video_url}")
+        logger.info(f"🎵 Adding to playlist: {video_url}")
         video_id = youtube_service.extract_video_id(video_url)
         if not video_id:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL or video ID")
@@ -496,40 +552,24 @@ async def play_music(video_url: str = Form(...)):
         if not video_info:
             raise HTTPException(status_code=404, detail="Video not found")
 
-        # Try to get audio stream
-        audio_url = await youtube_service.get_audio_stream_url(f"https://www.youtube.com/watch?v={video_id}")
-        
-        # If no stream found, use fallback
-        if not audio_url:
-            audio_url = await stream_with_fallback(video_id)
-            if not audio_url:
-                raise HTTPException(status_code=404, detail="No audio stream available for this track")
+        # Add to playlist
+        track = {**video_info, "url": video_url}
+        radio_state.playlist.append(track)
 
-        # Stop previous stream
-        if radio_state.stream_process:
-            radio_state.stream_process.terminate()
-            radio_state.is_streaming = False
-        
-        # Clear buffer
-        async with radio_state.buffer_lock:
-            radio_state.audio_buffer.clear()
-        
-        # Update state
-        radio_state.current_track = {**video_info, "url": audio_url, "source": "youtube_api"}
-        radio_state.current_audio_url = audio_url
-        radio_state.player_status = "playing"
-
-        # Start streaming
-        asyncio.create_task(stream_audio_to_buffer(audio_url))
+        # Ensure streaming is active
+        if radio_state.player_status != "playing" and not radio_state.is_streaming:
+            if not radio_state.stream_task or radio_state.stream_task.done():
+                radio_state.stream_task = asyncio.create_task(continuous_stream_loop())
 
         base_url = os.getenv("BASE_URL", "https://virus-music-backend-production.up.railway.app")
         
         return {
-            "status": "playing",
-            "track": radio_state.current_track,
+            "status": "added_to_playlist",
+            "track": track,
+            "position": len(radio_state.playlist),
             "radio_url": f"{base_url}/api/stream", 
             "listeners": len(radio_state.listeners),
-            "message": f"🎵 Now playing: {radio_state.current_track['title']} by {radio_state.current_track['artist']}"
+            "message": f"🎵 Added to playlist: {track['title']} by {track['artist']}"
         }
 
     except HTTPException:
@@ -589,14 +629,14 @@ async def stream_audio():
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
             "icy-br": "128",
-            "icy-name": "Virus Radio Live",
+            "icy-name": "Virus Radio 24/7",
             "icy-genre": "Various",
         }
     )
 
 @app.post("/api/stop")
 async def stop_music():
-    """Stop the live broadcast."""
+    """Stop the current track but keep the streaming loop running."""
     if radio_state.stream_process:
         radio_state.stream_process.terminate()
         radio_state.is_streaming = False
@@ -609,11 +649,12 @@ async def stop_music():
     async with radio_state.buffer_lock:
         radio_state.audio_buffer.clear()
     
-    logger.info("🛑 Music stopped")
+    logger.info("🛑 Current track stopped")
     return {
         "status": "stopped", 
-        "message": "Playback stopped",
-        "listeners": len(radio_state.listeners)
+        "message": "Current playback stopped",
+        "listeners": len(radio_state.listeners),
+        "streaming_loop": "active" if radio_state.stream_task and not radio_state.stream_task.done() else "inactive"
     }
 
 @app.get("/api/status")
@@ -624,7 +665,18 @@ async def get_player_status():
         "stream_active": radio_state.player_status == "playing",
         "listeners": len(radio_state.listeners),
         "buffer_size": len(radio_state.audio_buffer),
-        "is_streaming": radio_state.is_streaming
+        "is_streaming": radio_state.is_streaming,
+        "playlist_size": len(radio_state.playlist),
+        "continuous_mode": True
+    }
+
+@app.get("/api/playlist")
+async def get_playlist():
+    """Get current playlist."""
+    return {
+        "current": radio_state.current_track,
+        "queue": list(radio_state.playlist),
+        "total": len(radio_state.playlist)
     }
 
 @app.get("/api/radio/url")
@@ -636,7 +688,8 @@ async def get_radio_url():
         "current_track": radio_state.current_track['title'] if radio_state.current_track else 'No track playing',
         "artist": radio_state.current_track['artist'] if radio_state.current_track else 'None',
         "listeners": len(radio_state.listeners),
-        "live_broadcast": True
+        "live_broadcast": True,
+        "continuous_playback": True
     }
 
 @app.get("/health")
@@ -647,10 +700,12 @@ async def health_check():
         "player_status": radio_state.player_status,
         "listeners": len(radio_state.listeners),
         "buffer_size": len(radio_state.audio_buffer),
+        "playlist_size": len(radio_state.playlist),
         "features": {
             "yt_dlp": youtube_service.has_ytdlp,
             "youtube_api": bool(YOUTUBE_API_KEY),
-            "live_broadcast": True
+            "live_broadcast": True,
+            "continuous_playback": True
         }
     }
 
