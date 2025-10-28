@@ -260,29 +260,7 @@ async def get_audio_stream_piped(youtube_url: str) -> Optional[str]:
         logger.error(f"Piped error: {e}")
         return None
 
-async def get_audio_stream_multi_source(youtube_url: str) -> Optional[str]:
-    """Try multiple sources to get audio stream"""
-    
-    # Method 1: Try yt-dlp with anti-bot measures
-    logger.info("🎵 Method 1: yt-dlp with anti-bot config")
-    audio_url = await get_audio_stream_with_ytdlp(youtube_url)
-    if audio_url:
-        return audio_url
-    
-    # Method 2: Try Invidious
-    logger.info("🎵 Method 2: Invidious instances")
-    audio_url = await get_audio_stream_invidious(youtube_url)
-    if audio_url:
-        return audio_url
-    
-    # Method 3: Try Piped
-    logger.info("🎵 Method 3: Piped API")
-    audio_url = await get_audio_stream_piped(youtube_url)
-    if audio_url:
-        return audio_url
-    
-    logger.error(f"❌ All methods failed for: {youtube_url}")
-    return None
+async def get_audio_stream_with_ytdlp(youtube_url: str) -> Optional[str]:
     """Get audio stream URL using yt-dlp with anti-bot measures"""
     try:
         import yt_dlp
@@ -327,6 +305,30 @@ async def get_audio_stream_multi_source(youtube_url: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"yt-dlp error: {e}")
         return None
+
+async def get_audio_stream_multi_source(youtube_url: str) -> Optional[str]:
+    """Try multiple sources to get audio stream"""
+    
+    # Method 1: Try yt-dlp with anti-bot measures
+    logger.info("🎵 Method 1: yt-dlp with anti-bot config")
+    audio_url = await get_audio_stream_with_ytdlp(youtube_url)
+    if audio_url:
+        return audio_url
+    
+    # Method 2: Try Invidious
+    logger.info("🎵 Method 2: Invidious instances")
+    audio_url = await get_audio_stream_invidious(youtube_url)
+    if audio_url:
+        return audio_url
+    
+    # Method 3: Try Piped
+    logger.info("🎵 Method 3: Piped API")
+    audio_url = await get_audio_stream_piped(youtube_url)
+    if audio_url:
+        return audio_url
+    
+    logger.error(f"❌ All methods failed for: {youtube_url}")
+    return None
 
 async def stream_audio_to_buffer(audio_url: str):
     """
@@ -471,8 +473,8 @@ async def continuous_radio_loop():
             
             logger.info(f"▶️ NOW PLAYING: {track['title']} (Listeners: {len(radio_state.listeners)})")
             
-            # Get audio stream URL
-            audio_url = await get_audio_stream_with_ytdlp(track['url'])
+            # Get audio stream URL using multiple fallback methods
+            audio_url = await get_audio_stream_multi_source(track['url'])
             
             if audio_url:
                 # Stream this track to buffer (runs continuously)
