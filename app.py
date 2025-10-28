@@ -357,16 +357,22 @@ async def stream_audio_to_buffer(audio_url: str):
         logger.info(f"🎵 Starting FFmpeg stream for: {radio_state.current_track['title']}")
         logger.info(f"🔗 Audio URL: {audio_url[:100]}...")
         
-        # FFmpeg command to convert any audio to MP3 stream with better error handling
+        # Improved FFmpeg command for streaming with reconnection and better handling
         cmd = [
             'ffmpeg',
             '-i', audio_url,
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
             '-vn',  # No video
             '-acodec', 'libmp3lame',
             '-b:a', '128k',
             '-ar', '44100',
             '-ac', '2',
             '-f', 'mp3',
+            '-fflags', '+nobuffer+flush_packets',
+            '-flags', 'low_delay',
+            '-max_delay', '100000',  # 100ms max delay
             '-',  # Output to stdout
         ]
 
@@ -381,12 +387,26 @@ async def stream_audio_to_buffer(audio_url: str):
         
         # Read and buffer audio chunks CONTINUOUSLY
         chunk_count = 0
+        start_time = datetime.now()
+        
         while radio_state.is_streaming and process.poll() is None:
             chunk = process.stdout.read(4096)  # Smaller chunks for better streaming
             if not chunk:
                 # Check if process ended
                 if process.poll() is not None:
                     break
+                
+                # Check if we've been streaming for less than expected duration
+                elapsed = (datetime.now() - start_time).total_seconds()
+                expected_duration = radio_state.current_track.get('duration', 180)
+                
+                if elapsed < expected_duration - 10:  # If ended too early
+                    logger.warning(f"⚠️ Stream ended early ({elapsed:.1f}s/{expected_duration}s), may need reconnection")
+                    break
+                else:
+                    logger.info(f"✅ Stream completed normally ({elapsed:.1f}s)")
+                    break
+                
                 # Small delay before reading again
                 await asyncio.sleep(0.1)
                 continue
@@ -396,12 +416,13 @@ async def stream_audio_to_buffer(audio_url: str):
             # Store in circular buffer (always, even without listeners)
             async with radio_state.buffer_lock:
                 radio_state.audio_chunks.append(chunk)
-                if chunk_count % 10 == 0:  # Set event every 10 chunks to avoid too many events
+                if chunk_count % 5 == 0:  # Set event more frequently for better streaming
                     radio_state.chunk_event.set()
             
             # Log progress occasionally
-            if chunk_count % 100 == 0:
-                logger.info(f"📦 Buffered {chunk_count} chunks for {radio_state.current_track['title']}")
+            if chunk_count % 200 == 0:
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logger.info(f"📦 Buffered {chunk_count} chunks ({elapsed:.1f}s) for {radio_state.current_track['title']}")
             
             # Small delay to prevent CPU spinning
             await asyncio.sleep(0)
@@ -410,10 +431,13 @@ async def stream_audio_to_buffer(audio_url: str):
         if process.poll() is not None:
             stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
             if stderr_output:
-                logger.error(f"FFmpeg stderr: {stderr_output[:500]}")
+                # Only log errors, not normal completion messages
+                if "pipe:" not in stderr_output and "video:" not in stderr_output:
+                    logger.error(f"FFmpeg stderr: {stderr_output[:500]}")
             logger.info(f"✅ FFmpeg process ended with code: {process.returncode}")
         else:
-            logger.info(f"✅ Finished streaming: {radio_state.current_track['title']}")
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.info(f"✅ Finished streaming: {radio_state.current_track['title']} ({elapsed:.1f}s)")
         
     except Exception as e:
         logger.error(f"Streaming error: {e}")
@@ -534,6 +558,9 @@ async def continuous_radio_loop():
                 # Put track back at the end of playlist to retry later
                 radio_state.playlist.append(track)
                 await asyncio.sleep(2)
+            
+            # Small delay between tracks
+            await asyncio.sleep(1)
             
             # Track finished, continue to next
             logger.info(f"✅ Track completed. Queue size: {len(radio_state.playlist)}")
