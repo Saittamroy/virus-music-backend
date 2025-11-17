@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import aiohttp
 import os
 import asyncio
@@ -10,45 +10,11 @@ import subprocess
 from collections import deque
 from datetime import datetime
 import logging
-from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global state for live broadcasting
-class RadioState:
-    def __init__(self):
-        self.current_track = None
-        self.player_status = "stopped"
-        self.current_audio_url = None
-        self.audio_buffer = deque(maxlen=2000)  # Larger buffer
-        self.listeners = set()
-        self.buffer_lock = asyncio.Lock()
-        self.chunk_event = asyncio.Event()
-        self.stream_process = None
-        self.is_streaming = False
-        self.stream_task = None
-
-radio_state = RadioState()
-
-YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
-YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage aiohttp session lifecycle"""
-    global http_session
-    http_session = aiohttp.ClientSession()
-    yield
-    await http_session.close()
-    if radio_state.stream_process:
-        radio_state.stream_process.terminate()
-
-app = FastAPI(
-    title="Virus Music Radio API",
-    version="4.4.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="Live Music Radio Stream API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,23 +23,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class RadioState:
+    def __init__(self):
+        self.playlist: deque = deque(maxlen=100)
+        self.current_track: Optional[Dict] = None
+        self.is_streaming = False
+        self.is_paused = False
+        self.stream_process: Optional[subprocess.Popen] = None
+        self.audio_chunks: deque = deque(maxlen=500)
+        self.listeners = set()
+        self.stream_started_at: Optional[datetime] = None
+        self.buffer_lock = asyncio.Lock()
+        self.chunk_event = asyncio.Event()
+        self.skip_requested = False
+        
+radio_state = RadioState()
+
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3"
+
 class YouTubeAPIService:
     def __init__(self):
         self.api_key = YOUTUBE_API_KEY
         self.base_url = YOUTUBE_API_URL
-        self.has_ytdlp = self._check_ytdlp()
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    def _check_ytdlp(self) -> bool:
-        try:
-            import yt_dlp
-            return True
-        except ImportError:
-            logger.warning("⚠️ yt-dlp not installed")
-            return False
+    async def init_session(self):
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            )
+
+    async def close_session(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     async def search_music(self, query: str, limit: int = 10) -> List[Dict]:
+        await self.init_session()
         try:
-            logger.info(f"🔍 Searching: {query}")
+            if not self.api_key:
+                return []
+            
             params = {
                 'part': 'snippet',
                 'q': query,
@@ -83,11 +73,7 @@ class YouTubeAPIService:
                 'key': self.api_key
             }
 
-            async with http_session.get(
-                f"{self.base_url}/search",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
+            async with self.session.get(f"{self.base_url}/search", params=params) as response:
                 if response.status != 200:
                     return []
 
@@ -109,11 +95,10 @@ class YouTubeAPIService:
                         'source': 'youtube_api'
                     })
 
-                logger.info(f"✅ Found {len(results)} results")
                 return results
 
         except Exception as e:
-            logger.error(f"❌ Search error: {e}")
+            logger.error(f"Search error: {e}")
             return []
 
     async def get_video_duration(self, video_id: str) -> int:
@@ -124,11 +109,7 @@ class YouTubeAPIService:
                 'key': self.api_key
             }
 
-            async with http_session.get(
-                f"{self.base_url}/videos",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
+            async with self.session.get(f"{self.base_url}/videos", params=params) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data.get('items'):
@@ -148,18 +129,24 @@ class YouTubeAPIService:
         return hours * 3600 + minutes * 60 + seconds
 
     async def get_video_info(self, video_id: str) -> Optional[Dict]:
+        await self.init_session()
         try:
+            if not self.api_key:
+                return {
+                    'id': video_id,
+                    'title': f'Video {video_id}',
+                    'duration': 0,
+                    'thumbnail': '',
+                    'artist': 'Unknown',
+                }
+            
             params = {
                 'part': 'snippet,contentDetails',
                 'id': video_id,
                 'key': self.api_key
             }
 
-            async with http_session.get(
-                f"{self.base_url}/videos",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
+            async with self.session.get(f"{self.base_url}/videos", params=params) as response:
                 if response.status == 200:
                     data = await response.json()
                     if data.get('items'):
@@ -174,97 +161,8 @@ class YouTubeAPIService:
                         }
             return None
         except Exception as e:
-            logger.error(f"❌ Video info error: {e}")
+            logger.error(f"Video info error: {e}")
             return None
-
-    async def get_audio_stream_url(self, youtube_url: str) -> Optional[str]:
-        try:
-            video_id = self.extract_video_id(youtube_url)
-            if not video_id:
-                return None
-    
-            logger.info(f"🎵 Getting stream for: {video_id}")
-    
-            # Try yt-dlp with cookies/anti-bot measures
-            if self.has_ytdlp:
-                try:
-                    import yt_dlp
-                    ydl_opts = {
-                        'format': 'bestaudio/best',
-                        'quiet': True,
-                        'noplaylist': True,
-                        'extract_flat': False,
-                        'extractor_args': {
-                            'youtube': {
-                                'player_client': ['android', 'web'],
-                            }
-                        },
-                        'http_headers': {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        },
-                        # Add retry for bot detection
-                        'retries': 3,
-                        'fragment_retries': 3,
-                        'skip_download': True,
-                    }
-    
-                    def extract_info():
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            return ydl.extract_info(youtube_url, download=False)
-    
-                    info = await asyncio.get_event_loop().run_in_executor(None, extract_info)
-                    
-                    if 'url' in info:
-                        logger.info("✅ Stream via yt-dlp (direct)")
-                        return info['url']
-                    elif 'formats' in info:
-                        audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
-                        if audio_formats:
-                            best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
-                            logger.info("✅ Stream via yt-dlp (format)")
-                            return best_audio['url']
-                            
-                except Exception as e:
-                    logger.error(f"❌ yt-dlp failed: {e}")
-                    # Fall through to Invidious
-    
-            # Try Invidious as fallback
-            invidious_url = await self.get_invidious_stream(video_id)
-            if invidious_url:
-                return invidious_url
-    
-            return None
-    
-        except Exception as e:
-            logger.error(f"❌ Stream error: {e}")
-            return None
-
-    async def get_invidious_stream(self, video_id: str) -> Optional[str]:
-        invidious_instances = [
-            "https://invidious.privacydev.net",
-            "https://inv.tux.pizza",
-            "https://invidious.lunar.icu",
-        ]
-
-        for instance in invidious_instances:
-            try:
-                async with http_session.get(
-                    f"{instance}/api/v1/videos/{video_id}",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        audio_formats = [f for f in data.get('adaptiveFormats', []) 
-                                       if 'audio' in f.get('type', '')]
-                        if audio_formats:
-                            best_audio = max(audio_formats, key=lambda x: x.get('bitrate', 0))
-                            logger.info(f"✅ Stream via Invidious")
-                            return best_audio['url']
-            except Exception as e:
-                logger.error(f"❌ Invidious {instance} failed: {e}")
-                continue
-
-        return None
 
     def extract_video_id(self, url: str) -> Optional[str]:
         patterns = [
@@ -280,12 +178,53 @@ class YouTubeAPIService:
 
 youtube_service = YouTubeAPIService()
 
-async def stream_audio_to_buffer(audio_url: str):
-    """Stream audio continuously to buffer - PROPERLY."""
+async def get_audio_stream_with_ytdlp(youtube_url: str) -> Optional[str]:
     try:
-        logger.info("🎵 Starting FFmpeg continuous stream")
+        import yt_dlp
         
-        # FFmpeg with reconnection and error resilience
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': False,
+            'no_warnings': False,
+            'noplaylist': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android_creator', 'android', 'web'],
+                    'skip': ['hls', 'dash'],
+                }
+            },
+        }
+        
+        cookie_file = os.getenv('YOUTUBE_COOKIES_FILE')
+        if cookie_file and os.path.exists(cookie_file):
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"Using cookie file: {cookie_file}")
+        elif cookie_file:
+            logger.warning(f"Cookie file not found: {cookie_file}")
+
+        def extract():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(youtube_url, download=False)
+
+        info = await asyncio.get_event_loop().run_in_executor(None, extract)
+        
+        if 'url' in info:
+            return info['url']
+        elif 'formats' in info:
+            audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none']
+            if audio_formats:
+                best_audio = max(audio_formats, key=lambda x: x.get('abr', 0) or 0)
+                return best_audio['url']
+        
+        return None
+    except Exception as e:
+        logger.error(f"yt-dlp error: {e}")
+        return None
+
+async def stream_audio_to_buffer(audio_url: str):
+    try:
+        logger.info(f"🎵 Starting FFmpeg stream for: {radio_state.current_track['title']}")
+        
         cmd = [
             'ffmpeg',
             '-reconnect', '1',
@@ -298,216 +237,327 @@ async def stream_audio_to_buffer(audio_url: str):
             '-ar', '44100',
             '-ac', '2',
             '-f', 'mp3',
-            '-bufsize', '256k',
-            'pipe:1'
+            'pipe:1',
         ]
 
-        # Use asyncio subprocess for proper async handling
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=8192
         )
 
         radio_state.stream_process = process
-        radio_state.is_streaming = True
         
-        logger.info("▶️ FFmpeg started, reading audio chunks...")
-        
-        chunk_count = 0
-        
-        # Read audio continuously until process ends or stopped
-        while radio_state.is_streaming and process.returncode is None:
-            try:
-                # Read chunk asynchronously with timeout
-                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=5.0)
-                
-                if not chunk:
-                    logger.warning("⚠️ No more data from FFmpeg (EOF)")
-                    break
-                
-                chunk_count += 1
-                
-                # Add to circular buffer
-                async with radio_state.buffer_lock:
-                    radio_state.audio_buffer.append(chunk)
-                    radio_state.chunk_event.set()
-                
-                # Log progress every 100 chunks
-                if chunk_count % 100 == 0:
-                    logger.info(f"📊 Buffered {chunk_count} chunks, buffer size: {len(radio_state.audio_buffer)}")
-                
-            except asyncio.TimeoutError:
-                logger.warning("⚠️ Timeout reading from FFmpeg")
-                continue
-            except Exception as e:
-                logger.error(f"❌ Chunk read error: {e}")
+        while radio_state.is_streaming and not radio_state.is_paused and not radio_state.skip_requested and process.poll() is None:
+            chunk = process.stdout.read(8192)
+            if not chunk:
                 break
+            
+            async with radio_state.buffer_lock:
+                radio_state.audio_chunks.append(chunk)
+                radio_state.chunk_event.set()
+            
+            await asyncio.sleep(0)
         
-        logger.info(f"✅ Streaming completed. Total chunks: {chunk_count}")
+        if process.poll() is None:
+            process.terminate()
+            
+        logger.info(f"✅ Finished streaming: {radio_state.current_track['title']}")
         
     except Exception as e:
-        logger.error(f"❌ Stream to buffer error: {e}")
+        logger.error(f"Streaming error: {e}")
     finally:
-        radio_state.is_streaming = False
-        if process and process.returncode is None:
+        if process and process.poll() is None:
             process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-        
-        # Check stderr for FFmpeg errors
-        if process.stderr:
-            try:
-                stderr_output = await process.stderr.read()
-                if stderr_output:
-                    logger.error(f"FFmpeg stderr: {stderr_output.decode('utf-8', errors='ignore')[:500]}")
-            except Exception as e:
-                logger.error(f"Could not read stderr: {e}")
 
-# API Endpoints
+async def add_default_songs():
+    logger.info("📋 Adding default tracks to playlist...")
+    
+    default_songs = [
+        "kJQP7kiw5Fk",
+        "fJ9rUzIMcZQ",
+        "RgKAFK5djSk",
+    ]
+    
+    for video_id in default_songs:
+        try:
+            info = await youtube_service.get_video_info(video_id)
+            if info:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                radio_state.playlist.append({**info, 'url': url})
+                logger.info(f"✅ Added: {info['title']}")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"❌ Failed to add {video_id}: {e}")
+    
+    if radio_state.playlist:
+        logger.info(f"📋 Playlist ready with {len(radio_state.playlist)} songs")
+
+async def continuous_radio_loop():
+    logger.info("🎵 Starting continuous radio loop (24/7 mode)")
+    radio_state.is_streaming = True
+    radio_state.stream_started_at = datetime.now()
+    
+    if not radio_state.playlist:
+        await add_default_songs()
+    
+    while radio_state.is_streaming:
+        try:
+            while not radio_state.playlist and radio_state.is_streaming:
+                logger.warning("⚠️ Playlist empty, waiting for songs...")
+                await asyncio.sleep(5)
+            
+            if not radio_state.is_streaming:
+                break
+            
+            if radio_state.is_paused:
+                await asyncio.sleep(1)
+                continue
+            
+            track = radio_state.playlist.popleft()
+            radio_state.current_track = track
+            radio_state.skip_requested = False
+            
+            logger.info(f"▶️ NOW PLAYING: {track['title']} (Listeners: {len(radio_state.listeners)})")
+            
+            audio_url = await get_audio_stream_with_ytdlp(track['url'])
+            
+            if audio_url:
+                await stream_audio_to_buffer(audio_url)
+            else:
+                logger.warning(f"⚠️ Could not get audio for: {track['title']}")
+                await asyncio.sleep(2)
+            
+            logger.info(f"✅ Track completed. Queue size: {len(radio_state.playlist)}")
+            
+        except Exception as e:
+            logger.error(f"Radio loop error: {e}")
+            await asyncio.sleep(1)
+    
+    logger.info("🛑 Radio loop stopped")
+
+streaming_task: Optional[asyncio.Task] = None
+
+async def start_continuous_stream():
+    global streaming_task
+    
+    if streaming_task and not streaming_task.done():
+        logger.info("✅ Stream already running")
+        return
+    
+    radio_state.audio_chunks.clear()
+    radio_state.is_paused = False
+    
+    streaming_task = asyncio.create_task(continuous_radio_loop())
+    logger.info("✅ Continuous stream started (24/7 mode)")
+
+async def stop_continuous_stream():
+    global streaming_task
+    
+    logger.info("🛑 Stopping continuous stream...")
+    radio_state.is_streaming = False
+    
+    if radio_state.stream_process:
+        radio_state.stream_process.terminate()
+    
+    if streaming_task:
+        streaming_task.cancel()
+        try:
+            await streaming_task
+        except asyncio.CancelledError:
+            pass
+    
+    radio_state.current_track = None
+    radio_state.audio_chunks.clear()
+    logger.info("🛑 Continuous stream stopped")
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 API Starting...")
+    await youtube_service.init_session()
+    
+    await asyncio.sleep(1)
+    
+    if not radio_state.playlist:
+        await add_default_songs()
+    
+    if radio_state.playlist:
+        await start_continuous_stream()
+        logger.info("🚀 API Started - Radio streaming 24/7")
+    else:
+        logger.warning("⚠️ Could not add default songs. Use /api/request to add music.")
+        logger.info("🚀 API Started - Waiting for songs")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await stop_continuous_stream()
+    await youtube_service.close_session()
+    logger.info("👋 API Shutdown")
+
 @app.get("/")
 async def root():
     return {
-        "message": "Virus Music Radio API",
+        "message": "Live Music Radio Stream API",
         "status": "online",
-        "version": "4.4.0",
-        "listeners": len(radio_state.listeners),
+        "version": "1.0.0",
         "streaming": radio_state.is_streaming,
-        "buffer_size": len(radio_state.audio_buffer),
-        "current_track": radio_state.current_track['title'] if radio_state.current_track else None
+        "paused": radio_state.is_paused,
+        "current_track": radio_state.current_track['title'] if radio_state.current_track else None,
+        "playlist_size": len(radio_state.playlist),
+        "active_listeners": len(radio_state.listeners),
+        "buffer_size": len(radio_state.audio_chunks),
+        "stream_url": "/api/stream"
     }
 
 @app.get("/api/search")
-async def search_music(q: str = Query(...), limit: int = Query(10, ge=1, le=20)):
+async def search_music(q: str = Query(...), limit: int = Query(5, ge=1, le=20)):
     if not YOUTUBE_API_KEY:
         raise HTTPException(status_code=500, detail="YouTube API not configured")
     results = await youtube_service.search_music(q, limit)
     return {"query": q, "results": results, "count": len(results)}
 
-@app.post("/api/play")
-async def play_music(video_url: str = Form(...)):
+@app.post("/api/request")
+async def request_song(query: str = Form(...)):
     try:
-        logger.info(f"🎵 Play request: {video_url}")
+        video_id = youtube_service.extract_video_id(query)
         
-        video_id = youtube_service.extract_video_id(video_url)
         if not video_id:
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+            if YOUTUBE_API_KEY:
+                results = await youtube_service.search_music(query, 1)
+                if results:
+                    video_id = results[0]['id']
+                    video_info = results[0]
+                else:
+                    raise HTTPException(status_code=404, detail="No songs found")
+            else:
+                raise HTTPException(status_code=400, detail="Invalid YouTube URL and API not configured")
+        else:
+            video_info = await youtube_service.get_video_info(video_id)
+            if not video_info:
+                raise HTTPException(status_code=404, detail="Video not found")
 
-        video_info = await youtube_service.get_video_info(video_id)
-        if not video_info:
-            raise HTTPException(status_code=404, detail="Video not found")
-
-        audio_url = await youtube_service.get_audio_stream_url(f"https://www.youtube.com/watch?v={video_id}")
-        if not audio_url:
-            raise HTTPException(status_code=404, detail="No audio stream found")
-
-        # Stop previous stream
-        if radio_state.stream_process:
-            logger.info("🛑 Stopping previous stream")
-            radio_state.is_streaming = False
-            radio_state.stream_process.terminate()
-            try:
-                radio_state.stream_process.wait(timeout=2)
-            except:
-                radio_state.stream_process.kill()
-            
-            # Wait for old stream to fully stop
-            await asyncio.sleep(1)
+        track = {
+            **video_info,
+            'url': f"https://www.youtube.com/watch?v={video_id}",
+            'added_at': datetime.now().isoformat()
+        }
         
-        # Cancel old stream task
-        if radio_state.stream_task and not radio_state.stream_task.done():
-            radio_state.stream_task.cancel()
-            try:
-                await radio_state.stream_task
-            except asyncio.CancelledError:
-                pass
+        radio_state.playlist.append(track)
         
-        # Clear buffer for new track
-        async with radio_state.buffer_lock:
-            radio_state.audio_buffer.clear()
-        
-        # Update state
-        radio_state.current_track = {**video_info, "url": audio_url}
-        radio_state.current_audio_url = audio_url
-        radio_state.player_status = "playing"
-
-        # Start new stream in background
-        radio_state.stream_task = asyncio.create_task(stream_audio_to_buffer(audio_url))
-
-        base_url = os.getenv("BASE_URL", "https://virus-music-backend-production.up.railway.app")
-        
-        logger.info(f"✅ Now playing: {video_info['title']}")
+        if not radio_state.is_streaming:
+            await start_continuous_stream()
         
         return {
-            "status": "playing",
-            "track": radio_state.current_track,
-            "radio_url": f"{base_url}/api/stream",
-            "listeners": len(radio_state.listeners),
-            "message": f"🎵 Now playing: {video_info['title']}"
+            "status": "added_to_queue",
+            "track": track,
+            "position": len(radio_state.playlist),
+            "message": f"Added to queue: {track['title']}"
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Play error: {e}")
+        logger.error(f"Request song error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/stream")
-async def stream_audio():
-    """Live broadcast - all listeners hear same audio at same time."""
+@app.post("/api/skip")
+async def skip_song():
+    if not radio_state.current_track:
+        raise HTTPException(status_code=400, detail="No song playing")
     
+    logger.info(f"⏭️ Skipping: {radio_state.current_track['title']}")
+    
+    radio_state.skip_requested = True
+    
+    if radio_state.stream_process:
+        radio_state.stream_process.terminate()
+    
+    return {
+        "status": "skipped",
+        "skipped_track": radio_state.current_track['title'],
+        "next_in_queue": len(radio_state.playlist)
+    }
+
+@app.post("/api/pause")
+async def pause_playback():
+    if radio_state.is_paused:
+        raise HTTPException(status_code=400, detail="Already paused")
+    
+    logger.info("⏸️ Pausing playback")
+    radio_state.is_paused = True
+    
+    if radio_state.stream_process:
+        radio_state.stream_process.terminate()
+    
+    return {
+        "status": "paused",
+        "message": "Broadcast paused"
+    }
+
+@app.post("/api/resume")
+async def resume_playback():
+    if not radio_state.is_paused:
+        raise HTTPException(status_code=400, detail="Not paused")
+    
+    logger.info("▶️ Resuming playback")
+    radio_state.is_paused = False
+    
+    return {
+        "status": "resumed",
+        "message": "Broadcast resumed"
+    }
+
+@app.get("/api/nowplaying")
+async def now_playing():
+    if not radio_state.current_track:
+        return {"playing": False, "message": "Nothing playing"}
+    
+    return {
+        "playing": True,
+        "paused": radio_state.is_paused,
+        "track": radio_state.current_track,
+        "listeners": len(radio_state.listeners),
+        "queue_size": len(radio_state.playlist)
+    }
+
+@app.get("/api/queue")
+async def get_queue():
+    return {
+        "current": radio_state.current_track,
+        "queue": list(radio_state.playlist),
+        "total": len(radio_state.playlist)
+    }
+
+@app.get("/api/stream")
+async def stream_radio():
     listener_id = id(asyncio.current_task())
     radio_state.listeners.add(listener_id)
     
-    logger.info(f"👤 Listener joined (Total: {len(radio_state.listeners)})")
+    logger.info(f"👤 New listener connected (Total: {len(radio_state.listeners)})")
     
     async def generate_live_audio() -> AsyncIterator[bytes]:
         try:
-            # Start from near the end of buffer (live position)
-            async with radio_state.buffer_lock:
-                current_position = max(0, len(radio_state.audio_buffer) - 50)
+            chunk_index = max(0, len(radio_state.audio_chunks) - 10)
             
-            logger.info(f"📍 Starting at buffer position {current_position}")
-            
-            silence_count = 0
-            
-            while radio_state.player_status == "playing":
-                async with radio_state.buffer_lock:
-                    buffer_size = len(radio_state.audio_buffer)
+            while radio_state.is_streaming:
+                if radio_state.is_paused:
+                    await asyncio.sleep(0.5)
+                    continue
                 
-                # Send available chunks
-                if current_position < buffer_size:
-                    async with radio_state.buffer_lock:
-                        chunk = radio_state.audio_buffer[current_position]
-                    
+                if chunk_index < len(radio_state.audio_chunks):
+                    chunk = radio_state.audio_chunks[chunk_index]
+                    chunk_index += 1
                     yield chunk
-                    current_position += 1
-                    silence_count = 0
-                    
                 else:
-                    # Wait for new chunks
+                    radio_state.chunk_event.clear()
                     try:
                         await asyncio.wait_for(radio_state.chunk_event.wait(), timeout=2.0)
-                        radio_state.chunk_event.clear()
                     except asyncio.TimeoutError:
-                        # Send silence if no new audio
-                        yield b'\x00' * 4096
-                        silence_count += 1
-                        
-                        # If too much silence, stream might have ended
-                        if silence_count > 5:
-                            logger.warning("⚠️ No audio for 10s, stopping listener")
-                            break
-                
-        except asyncio.CancelledError:
-            logger.info(f"👤 Listener left (Total: {len(radio_state.listeners) - 1})")
-        except Exception as e:
-            logger.error(f"❌ Stream error: {e}")
+                        continue
         finally:
             radio_state.listeners.discard(listener_id)
+            logger.info(f"👤 Listener disconnected (Remaining: {len(radio_state.listeners)})")
     
     return StreamingResponse(
         generate_live_audio(),
@@ -516,67 +566,9 @@ async def stream_audio():
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "icy-br": "128",
-            "icy-name": "Virus Radio",
         }
     )
 
-@app.post("/api/stop")
-async def stop_music():
-    logger.info("🛑 Stopping music")
-    
-    radio_state.is_streaming = False
-    
-    if radio_state.stream_process:
-        radio_state.stream_process.terminate()
-        try:
-            await asyncio.wait_for(radio_state.stream_process.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            radio_state.stream_process.kill()
-            await radio_state.stream_process.wait()
-    
-    radio_state.current_track = None
-    radio_state.player_status = "stopped"
-    radio_state.current_audio_url = None
-    
-    async with radio_state.buffer_lock:
-        radio_state.audio_buffer.clear()
-    
-    return {"status": "stopped", "listeners": len(radio_state.listeners)}
-
-@app.get("/api/status")
-async def get_player_status():
-    return {
-        "status": radio_state.player_status,
-        "current_track": radio_state.current_track,
-        "stream_active": radio_state.is_streaming,
-        "listeners": len(radio_state.listeners),
-        "buffer_size": len(radio_state.audio_buffer),
-    }
-
-@app.get("/api/radio/url")
-async def get_radio_url():
-    base_url = os.getenv("BASE_URL", "https://virus-music-backend-production.up.railway.app")
-    return {
-        "radio_url": f"{base_url}/api/stream",
-        "status": radio_state.player_status,
-        "current_track": radio_state.current_track['title'] if radio_state.current_track else None,
-        "listeners": len(radio_state.listeners),
-    }
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "version": "4.4.0",
-        "streaming": radio_state.is_streaming,
-        "listeners": len(radio_state.listeners),
-        "buffer_size": len(radio_state.audio_buffer),
-    }
-
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
