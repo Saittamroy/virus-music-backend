@@ -222,6 +222,7 @@ async def get_audio_stream_with_ytdlp(youtube_url: str) -> Optional[str]:
         return None
 
 async def stream_audio_to_buffer(audio_url: str):
+    process = None
     try:
         logger.info(f"🎵 Starting FFmpeg stream for: {radio_state.current_track['title']}")
         
@@ -243,33 +244,58 @@ async def stream_audio_to_buffer(audio_url: str):
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=8192
         )
 
         radio_state.stream_process = process
         
+        loop = asyncio.get_event_loop()
+        chunk_count = 0
+        
         while radio_state.is_streaming and not radio_state.is_paused and not radio_state.skip_requested and process.poll() is None:
-            chunk = process.stdout.read(8192)
+            chunk = await loop.run_in_executor(None, process.stdout.read, 8192)
+            
             if not chunk:
                 break
+            
+            chunk_count += 1
             
             async with radio_state.buffer_lock:
                 radio_state.audio_chunks.append(chunk)
                 radio_state.chunk_event.set()
             
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
         
         if process.poll() is None:
             process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        
+        stderr_output = process.stderr.read().decode('utf-8', errors='ignore') if process.stderr else ""
+        
+        if process.returncode != 0 and process.returncode is not None:
+            logger.error(f"❌ FFmpeg exited with code {process.returncode}")
+            if stderr_output:
+                logger.error(f"FFmpeg stderr:\n{stderr_output[-500:]}")
+        elif chunk_count == 0:
+            logger.error(f"❌ No chunks were read! FFmpeg stderr:\n{stderr_output[-500:]}")
             
-        logger.info(f"✅ Finished streaming: {radio_state.current_track['title']}")
+        logger.info(f"✅ Finished streaming: {radio_state.current_track['title']} (Total chunks: {chunk_count})")
         
     except Exception as e:
         logger.error(f"Streaming error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
         if process and process.poll() is None:
             process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
 
 async def add_default_songs():
     logger.info("📋 Adding default tracks to playlist...")
